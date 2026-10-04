@@ -86,6 +86,10 @@ POWER_PROFILE_SCRIPT="$HOME/.config/hypr/scripts/power-profile-default.sh"
 
 # Battery charge limit udev rule path
 BATTERY_LIMIT_UDEV_RULE="/etc/udev/rules.d/99-battery-charge-limit.rules"
+# Kernel power-supply and backlight classes (plain assignments, never taken
+# from the environment)
+POWER_SUPPLY_DIR="/sys/class/power_supply"
+BACKLIGHT_DIR="/sys/class/backlight"
 
 # Power profile auto-switch udev rule and script paths
 POWER_AUTO_SWITCH_UDEV_RULE="/etc/udev/rules.d/99-power-profile.rules"
@@ -111,6 +115,8 @@ fi
 
 # Published script, used when the menu entry has no local checkout to run
 ALC_SCRIPT_URL="https://raw.githubusercontent.com/DanielCoffey1/a-la-carchy/master/a-la-carchy.sh"
+ALC_SUPERSONIC_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/extras/supersonic"
+ALC_AGENTS_CLONE_DIR="${ALC_SUPERSONIC_DIR%/supersonic}/agents-clone"
 
 # Omarchy's Hyprland config is Lua; a-la-carchy edits live in marked blocks
 # inside the user files so they can be updated or removed cleanly.
@@ -140,33 +146,49 @@ lua_block_get() {
     ' "$1"
 }
 
-lua_block_remove() {
-    local file="$1" start="-- >>> a-la-carchy $2" end="-- <<< a-la-carchy $2"
+# Remove every block between two exact marker lines (markers included).
+# Usage: marked_block_remove <file> <start-line> <end-line> [keep-blank]
+# By default the blank line written before a block goes with it; "keep-blank"
+# leaves surrounding lines alone (for files where we never wrote one).
+marked_block_remove() {
+    local file="$1" start="$2" end="$3" keep_blank=0
+    [[ "${4:-}" == keep-blank ]] && keep_blank=1
     [[ -f "$file" ]] || return 0
-    # Drop the block and the blank line written before it. A blank line is held
-    # back until we know whether a block starts right after it.
-    awk -v s="$start" -v e="$end" '
-        $0 == s { skip = 1; held = 0; next }
+    # An incomplete/nested marker must not eat the remainder of user config.
+    if ! awk -v s="$start" -v e="$end" '
+        $0 == s { if (open) bad = 1; open = 1 }
+        $0 == e { if (!open) bad = 1; open = 0 }
+        END { exit (bad || open) ? 1 : 0 }
+    ' "$file"; then
+        printf 'Malformed managed block in %s; left unchanged.\n' "$file" >&2
+        return 1
+    fi
+    # A blank line is held back until we know whether a block starts right
+    # after it. Written back in place so the file keeps its permissions.
+    local tmp rc=0
+    tmp=$(mktemp "${file}.tmp.XXXXXX") || return 1
+    awk -v s="$start" -v e="$end" -v keep="$keep_blank" '
+        $0 == s { skip = 1; if (keep && held) print ""; held = 0; next }
         $0 == e { skip = 0; next }
         skip { next }
         held { print ""; held = 0 }
         $0 == "" { held = 1; next }
         { print }
         END { if (held) print "" }
-    ' "$file" > "${file}.tmp" && cat "${file}.tmp" > "$file"
-    rm -f "${file}.tmp"
+    ' "$file" > "$tmp" && cat "$tmp" > "$file" || rc=1
+    rm -f -- "$tmp"
+    return "$rc"
+}
+
+lua_block_remove() {
+    marked_block_remove "$1" "-- >>> a-la-carchy $2" "-- <<< a-la-carchy $2"
 }
 
 # Replace (or add) a managed Lua block at the end of a file
 lua_block_write() {
     local file="$1" id="$2" content="$3"
-    lua_block_remove "$file" "$id"
-    {
-        echo ""
-        echo "-- >>> a-la-carchy $id"
-        echo "$content"
-        echo "-- <<< a-la-carchy $id"
-    } >> "$file"
+    lua_block_remove "$file" "$id" || return 1
+    printf '\n%s\n%s\n%s\n' "-- >>> a-la-carchy $id" "$content" "-- <<< a-la-carchy $id" >> "$file"
 }
 
 AUTOSTART_LUA="$HYPR_DIR/autostart.lua"
@@ -205,6 +227,10 @@ shell_bar_remove() {
     shell_json_jq --arg id "$1" '.bar.layout |= with_entries(.value |= map(select(.id != $id)))'
 }
 
+# Why a helper refused a change. The next action clears the screen, so the
+# final summary is the only place a reason stays readable.
+ALC_CHANGE_NOTE=""
+
 # Run a shell-bar change with the standard confirm/backup/log flow.
 # Usage: apply_shell_change <title> <explanation> <summary> <check-fn> <apply-fn>
 # check-fn returns 0 when the change is already in place.
@@ -227,6 +253,13 @@ apply_shell_change() {
         return 1
     fi
 
+    if ! jq -e 'type == "object" and (.bar.layout | type == "object") and
+        (.bar.layout | to_entries | all(.[]; .value | type == "array"))' "$SHELL_JSON" >/dev/null 2>&1; then
+        echo "  Invalid shell config; nothing was changed."
+        SUMMARY_LOG+=("✗  $summary -- failed (invalid shell config)")
+        return 1
+    fi
+
     if "$check_fn"; then
         echo -e "  ${DIM}Already set. Nothing to do.${RESET}"
         echo
@@ -235,14 +268,19 @@ apply_shell_change() {
     fi
 
     confirm_continue "$summary" || return 0
-    backup_file "$SHELL_JSON"
+    if ! backup_file "$SHELL_JSON"; then
+        SUMMARY_LOG+=("✗  $summary -- failed (backup failed)")
+        return 1
+    fi
 
-    if "$apply_fn"; then
+    ALC_CHANGE_NOTE=""
+    if "$apply_fn" && "$check_fn"; then
         echo -e "  ${CHECKED}✓${RESET}  $summary"
         SUMMARY_LOG+=("✓  $summary")
     else
         echo -e "  ${DIM}✗${RESET}  $summary -- failed"
-        SUMMARY_LOG+=("✗  $summary -- failed")
+        SUMMARY_LOG+=("✗  $summary -- failed${ALC_CHANGE_NOTE:+ ($ALC_CHANGE_NOTE)}")
+        return 1
     fi
     echo
 }
@@ -265,18 +303,32 @@ confirm_continue() {
 }
 
 backup_file() {
-    local backup="${1}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$1" "$backup"
+    local backup
+    backup=$(mktemp "${1}.backup.$(date +%Y%m%d_%H%M%S).XXXXXX") || return 1
+    if ! cp -- "$1" "$backup"; then
+        rm -f -- "$backup"
+        return 1
+    fi
     echo -e "  ${DIM}Backup: $backup${RESET}"
 }
 
 # Reload Hyprland and report any config errors the change introduced
 hypr_reload_check() {
-    command -v hyprctl &>/dev/null && [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] || return 0
-    hyprctl reload &>/dev/null
+    if [[ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
+        echo "  No live Hyprland session; runtime validation skipped."
+        return 0
+    fi
+    if ! command -v hyprctl &>/dev/null || ! hyprctl reload; then
+        echo "  Hyprland reload failed." >&2
+        return 1
+    fi
     sleep 0.5
     local errors
-    errors=$(hyprctl configerrors 2>/dev/null | sed '/^[[:space:]]*$/d')
+    if ! errors=$(hyprctl configerrors); then
+        echo "  Could not query Hyprland config errors." >&2
+        return 1
+    fi
+    errors=$(sed '/^[[:space:]]*$/d' <<< "$errors")
     if [[ -n "$errors" ]]; then
         echo -e "  ${BOLD}Hyprland reported config errors:${RESET}"
         echo "$errors" | sed 's/^/    /'
@@ -323,11 +375,20 @@ apply_lua_block() {
 
     confirm_continue "$summary" || return 0
 
-    backup_file "$file"
+    if ! backup_file "$file"; then
+        SUMMARY_LOG+=("✗  $summary -- failed (backup failed)")
+        return 1
+    fi
     if [[ -n "$content" ]]; then
-        lua_block_write "$file" "$id" "$content"
+        if ! lua_block_write "$file" "$id" "$content"; then
+            SUMMARY_LOG+=("✗  $summary -- failed (config write failed)")
+            return 1
+        fi
     else
-        lua_block_remove "$file" "$id"
+        if ! lua_block_remove "$file" "$id"; then
+            SUMMARY_LOG+=("✗  $summary -- failed (config write failed)")
+            return 1
+        fi
     fi
 
     if hypr_reload_check; then
@@ -335,6 +396,7 @@ apply_lua_block() {
         SUMMARY_LOG+=("✓  $summary")
     else
         SUMMARY_LOG+=("✗  $summary -- Hyprland reported config errors")
+        return 1
     fi
     echo
 }
@@ -342,6 +404,115 @@ apply_lua_block() {
 # Function to check if package is installed
 is_package_installed() {
     pacman -Qi "$1" &>/dev/null
+}
+
+# Explicit application allowlist: never infer removal targets from "speech" or
+# "whisper" substrings (shared libraries and AI runtimes also use those names).
+# User configuration, recordings, models and shared dependencies are preserved.
+dictation_inventory() {
+    DICTATION_PACKAGES=()
+    DICTATION_FLATPAKS=()
+    local installed pkg scope
+    installed=$(pacman -Qq) || return 1
+    while IFS= read -r pkg; do
+        case "$pkg" in
+            voxtype|voxtype-bin|voxtype-git|hyprwhspr|hyprwhspr-bin|hyprwhspr-git|nerd-dictation|nerd-dictation-git|speech-note|speech-note-bin|speech-note-git)
+                DICTATION_PACKAGES+=("$pkg") ;;
+        esac
+    done <<< "$installed"
+    if command -v flatpak &>/dev/null; then
+        for scope in user system; do
+            installed=$(flatpak list "--$scope" --app --columns=application) || return 1
+            while IFS= read -r pkg; do
+                if [[ "$pkg" == net.mkiol.SpeechNote ]]; then
+                    DICTATION_FLATPAKS+=("$scope")
+                    break
+                fi
+            done <<< "$installed"
+        done
+    fi
+    return 0
+}
+
+remove_voice_dictation() {
+    echo
+    echo -e "${BOLD}  Remove voice dictation${RESET}"
+    if ! dictation_inventory; then
+        echo "  Could not inventory dictation packages. Nothing was changed."
+        SUMMARY_LOG+=("✗  Dictation removal -- package inventory failed")
+        return 1
+    fi
+
+    local pkg scope unit state app failed=false
+    if (( ${#DICTATION_PACKAGES[@]} + ${#DICTATION_FLATPAKS[@]} == 0 )); then
+        echo "  No supported dictation packages installed."
+    else
+        echo "  Packages to remove:"
+        for pkg in "${DICTATION_PACKAGES[@]}"; do printf '    pacman: %s\n' "$pkg"; done
+        for scope in "${DICTATION_FLATPAKS[@]}"; do printf '    Flatpak (%s): net.mkiol.SpeechNote\n' "$scope"; done
+        echo "  Keeps models, recordings, configuration, and shared dependencies."
+        echo "  Package-manager confirmation may still be required."
+        confirm_continue "Remove the listed voice dictation applications" || return 0
+
+        # Only stop known app services associated with selected native packages.
+        # Refuse to continue on a service error rather than uninstall a live daemon.
+        local -A units=()
+        for pkg in "${DICTATION_PACKAGES[@]}"; do
+            case "$pkg" in
+                voxtype*) units[voxtype.service]=1 ;;
+                hyprwhspr*) units[hyprwhspr.service]=1 ;;
+                nerd-dictation*) units[nerd-dictation.service]=1 ;;
+            esac
+        done
+        for unit in "${!units[@]}"; do
+            state=$(systemctl --user show --property=LoadState --value "$unit")
+            if [[ "$state" == not-found ]]; then continue; fi
+            if [[ "$state" != loaded ]] || ! systemctl --user disable --now "$unit"; then
+                echo "  Could not disable $unit; removal stopped. Previously stopped services may need restarting."
+                SUMMARY_LOG+=("✗  Dictation removal -- service stop failed: $unit")
+                return 1
+            fi
+        done
+
+        # No recursive/cascade removal, dependency bypass, or blanket orphan cleanup.
+        # Keep pacman's own confirmation and error output visible.
+        if (( ${#DICTATION_PACKAGES[@]} )); then
+            if ! sudo pacman -R -- "${DICTATION_PACKAGES[@]}"; then failed=true; fi
+        fi
+        for scope in "${DICTATION_FLATPAKS[@]}"; do
+            if ! flatpak uninstall "--$scope" --noninteractive net.mkiol.SpeechNote; then failed=true; fi
+        done
+        if ! dictation_inventory; then
+            echo "  Could not verify remaining dictation packages."
+            failed=true
+        elif (( ${#DICTATION_PACKAGES[@]} + ${#DICTATION_FLATPAKS[@]} )); then
+            echo "  Some supported dictation packages remain installed."
+            failed=true
+        fi
+        # Omarchy conditionally loads its Voxtype binds when the binary exists.
+        if command -v hyprctl &>/dev/null && [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
+            if ! hyprctl reload; then failed=true; fi
+        fi
+        if $failed; then
+            echo "  Removal incomplete. Review errors above; stopped services may need restarting."
+            SUMMARY_LOG+=("✗  Dictation removal -- incomplete (see errors)")
+            return 1
+        fi
+    fi
+
+    # Do not delete unowned executables or guess how pip/manual installations work.
+    for app in voxtype hyprwhspr nerd-dictation speech-note dsnote; do
+        if command -v "$app" &>/dev/null; then
+            echo "  Still on PATH: $app -- remove using its original installer."
+            failed=true
+        fi
+    done
+    if $failed; then
+        SUMMARY_LOG+=("✗  Dictation removal -- unmanaged commands remain")
+        return 1
+    fi
+    echo "  No supported dictation apps remain. Manually installed apps are not exhaustively detected."
+    SUMMARY_LOG+=("✓  Dictation removal -- no supported apps remain (user data kept)")
 }
 
 # Function to check if webapp is installed
@@ -851,6 +1022,14 @@ edit_binding() {
     esac
 }
 
+# A color the configurator accepts: rgba(...)/rgb(...) values, an optional
+# gradient angle, or 0xAARRGGBB. Limited to color-syntax characters because the
+# value is written into a quoted Lua string.
+hypr_color_valid() {
+    [[ "$1" =~ ^[0-9a-zA-Z\(\),.\ ]+$ ]] || return 1
+    [[ "$1" =~ rgba?\( || "$1" =~ ^0x[0-9a-fA-F]+$ ]]
+}
+
 # Guided Hyprland setting edit dialog
 # Dispatches based on type_info: bool, int, float, enum, color
 edit_hypr_setting() {
@@ -1021,8 +1200,7 @@ edit_hypr_setting() {
                 return  # Cancel on empty input
             fi
 
-            # Basic validation: must contain rgba( or rgb( or be a hex color
-            if [[ "$new_val" =~ rgba?\( ]] || [[ "$new_val" =~ ^0x[0-9a-fA-F]+$ ]]; then
+            if hypr_color_valid "$new_val"; then
                 HYPR_EDITS[$id]="$new_val"
                 return
             else
@@ -1076,7 +1254,8 @@ apply_hypr_edits() {
 
     echo
 
-    local marker_start marker_end
+    local marker_start marker_end failed=false
+    local -a written=()
 
     # Group edits by config file, then by section_path
     for target_file in "looknfeel" "input"; do
@@ -1109,13 +1288,16 @@ apply_hypr_edits() {
         if [[ ! -f "$conf" ]]; then
             echo -e "  ${DIM}✗${RESET}  ${conf##*/} not found at $conf"
             SUMMARY_LOG+=("✗  Hyprland: ${conf##*/} -- failed (config not found)")
+            failed=true
             continue
         fi
 
-        # Backup
-        local backup_file="${conf}.backup.$(date +%Y%m%d_%H%M%S)"
-        cp "$conf" "$backup_file"
-        echo -e "  ${DIM}Backup: $backup_file${RESET}"
+        if ! backup_file "$conf"; then
+            echo -e "  ${DIM}✗${RESET}  Could not back up ${conf##*/}; it was left unchanged"
+            SUMMARY_LOG+=("✗  Hyprland: ${conf##*/} -- failed (backup failed)")
+            failed=true
+            continue
+        fi
 
         local block=""
         marker_start="-- === a-la-carchy hyprland settings ==="
@@ -1134,37 +1316,41 @@ apply_hypr_edits() {
 
         block+="$marker_end"
 
-        # Remove existing managed block if present, then append new one
-        if grep -qF -- "$marker_start" "$conf"; then
-            # Use awk to remove the block
-            awk -v start="$marker_start" -v end="$marker_end" '
-                $0 == start { skip=1; next }
-                $0 == end { skip=0; next }
-                !skip { print }
-            ' "$conf" > "${conf}.tmp"
-            mv "${conf}.tmp" "$conf"
+        # Replace the managed block (and the blank line written before it). A
+        # damaged block is refused rather than deleting what follows it.
+        if ! marked_block_remove "$conf" "$marker_start" "$marker_end" || ! printf '\n%s\n' "$block" >> "$conf"; then
+            echo -e "  ${DIM}✗${RESET}  Could not update ${conf##*/}; see the backup above"
+            SUMMARY_LOG+=("✗  Hyprland: ${conf##*/} -- failed (config write failed)")
+            failed=true
+            continue
         fi
 
-        # Append the new managed block
-        echo "" >> "$conf"
-        echo "$block" >> "$conf"
-
-        # Log each changed setting
         for full_key in "${!edited_keys[@]}"; do
-            local key="${full_key##*.}"
-            local val="${file_edits[$full_key]}"
-            echo -e "    ${CHECKED}✓${RESET}  ${full_key} = ${val}"
-            SUMMARY_LOG+=("✓  Hyprland: ${full_key} = ${val}")
+            written+=("${full_key} = ${file_edits[$full_key]}")
         done
     done
 
+    # Nothing is reported as applied until Hyprland has accepted the files.
+    local entry
     echo
+    if [[ ${#written[@]} -eq 0 ]]; then
+        echo
+        return 1
+    fi
     if hypr_reload_check; then
+        for entry in "${written[@]}"; do
+            echo -e "    ${CHECKED}✓${RESET}  $entry"
+            SUMMARY_LOG+=("✓  Hyprland: $entry")
+        done
         echo -e "  ${DIM}Hyprland reloaded the config.${RESET}"
     else
-        SUMMARY_LOG+=("✗  Hyprland settings -- Hyprland reported config errors")
+        for entry in "${written[@]}"; do
+            SUMMARY_LOG+=("✗  Hyprland: $entry -- written, but Hyprland reported config errors")
+        done
+        failed=true
     fi
     echo
+    [[ "$failed" == false ]]
 }
 
 # Apply all pending keybinding edits to bindings.lua
@@ -1198,7 +1384,10 @@ apply_binding_edits() {
         return 1
     fi
 
-    backup_file "$BINDINGS_LUA"
+    if ! backup_file "$BINDINGS_LUA"; then
+        SUMMARY_LOG+=("✗  Keybinding edits -- failed (backup failed)")
+        return 1
+    fi
     echo
 
     # Rebuild the keybind-edits block from every moved binding: the key it
@@ -1223,11 +1412,18 @@ apply_binding_edits() {
         block+="o.bind(\"$new_keys\", \"$desc\", ${BINDING_LUA_ACTIONS[$action_idx]})"$'\n'
     done
 
+    local saved=true
     if [[ -n "$block" ]]; then
-        lua_block_write "$BINDINGS_LUA" "keybind-edits" "${block%$'\n'}"
+        lua_block_write "$BINDINGS_LUA" "keybind-edits" "${block%$'\n'}" || saved=false
     else
-        lua_block_remove "$BINDINGS_LUA" "keybind-edits"
+        lua_block_remove "$BINDINGS_LUA" "keybind-edits" || saved=false
     fi
+    if ! $saved; then
+        echo -e "  ${DIM}✗${RESET}  Could not update bindings.lua; see the backup above"
+        SUMMARY_LOG+=("✗  Keybinding edits -- failed (config write failed)")
+        return 1
+    fi
+    workspace_nav_keep_last
 
     local ok=true
     hypr_reload_check || ok=false
@@ -1243,6 +1439,7 @@ apply_binding_edits() {
         fi
     done
     echo
+    $ok
 }
 
 # Function to rebind close window from SUPER+W to SUPER+Q
@@ -1394,8 +1591,12 @@ else
     exit 1
 fi
 RESTORE_EOF
-
-    chmod +x "$restore_script"
+    if [[ $? != 0 ]] || ! chmod +x "$restore_script"; then
+        echo -e "    ${DIM}✗${RESET}  Archive created, but the restore script could not be written"
+        echo
+        SUMMARY_LOG+=("✗  Backup config -- archive created at $archive, but the restore script could not be written")
+        return 1
+    fi
 
     echo -e "    ${CHECKED}✓${RESET}  Restore script: $restore_script"
     echo
@@ -1421,7 +1622,8 @@ set_monitor_scale() {
     echo
     echo
 
-    if [[ ! -f "$MONITORS_LUA" ]] || ! grep -q "^local omarchy_gdk_scale = " "$MONITORS_LUA"; then
+    if [[ ! -f "$MONITORS_LUA" ]] || ! grep -q "^local omarchy_gdk_scale = " "$MONITORS_LUA" ||
+       ! grep -q "^local omarchy_monitor_scale = " "$MONITORS_LUA"; then
         echo -e "  ${DIM}✗${RESET}  Omarchy scale settings not found in $MONITORS_LUA"
         echo -e "  ${DIM}    Run 'omarchy refresh config hypr/monitors.lua' to restore them.${RESET}"
         echo
@@ -1431,21 +1633,35 @@ set_monitor_scale() {
 
     confirm_continue "Monitor scaling $label" || return 0
 
-    backup_file "$MONITORS_LUA"
-    sed -i \
+    if ! backup_file "$MONITORS_LUA"; then
+        SUMMARY_LOG+=("✗  Monitor scaling $label -- failed (backup failed)")
+        return 1
+    fi
+    # Edit through a symlinked config instead of replacing the link, then make
+    # sure both variables really carry the requested values.
+    if ! sed -i --follow-symlinks \
         -e "s/^local omarchy_gdk_scale = .*/local omarchy_gdk_scale = $gdk_scale/" \
         -e "s/^local omarchy_monitor_scale = .*/local omarchy_monitor_scale = $monitor_scale/" \
-        "$MONITORS_LUA"
+        "$MONITORS_LUA" ||
+       ! grep -qxF "local omarchy_gdk_scale = $gdk_scale" "$MONITORS_LUA" ||
+       ! grep -qxF "local omarchy_monitor_scale = $monitor_scale" "$MONITORS_LUA"; then
+        echo -e "  ${DIM}✗${RESET}  Could not set both scale variables in $MONITORS_LUA"
+        SUMMARY_LOG+=("✗  Monitor scaling $label -- failed (scale variables not written)")
+        return 1
+    fi
 
+    local rc=0
     if hypr_reload_check; then
         echo -e "    ${CHECKED}✓${RESET}  Monitor scaling set to $label"
         SUMMARY_LOG+=("✓  Monitor scaling set to $label")
     else
         SUMMARY_LOG+=("✗  Monitor scaling $label -- Hyprland reported config errors")
+        rc=1
     fi
     echo
     echo -e "  ${DIM}GDK_SCALE applies to apps started after the next login.${RESET}"
     echo
+    return "$rc"
 }
 
 set_monitor_4k() {
@@ -1945,7 +2161,10 @@ apply_monitor_positions() {
     fi
 
     echo
-    backup_file "$MONITORS_LUA"
+    if ! backup_file "$MONITORS_LUA"; then
+        SUMMARY_LOG+=("✗  Monitor positions -- failed (backup failed)")
+        return 1
+    fi
 
     # One rule per monitor, matched by description so it survives port changes.
     # Mode, VRR and bit depth come from the live state, so the layout block never
@@ -1968,17 +2187,24 @@ apply_monitor_positions() {
     done
     block="${block%$'\n'}"
 
-    lua_block_write "$MONITORS_LUA" "monitor-layout" "$block"
+    if ! lua_block_write "$MONITORS_LUA" "monitor-layout" "$block"; then
+        echo -e "    ${DIM}✗${RESET}  Could not save the layout to monitors.lua"
+        SUMMARY_LOG+=("✗  Monitor positions -- failed (config write failed)")
+        return 1
+    fi
     echo -e "    ${CHECKED}✓${RESET}  Layout saved to monitors.lua"
 
+    local rc=0
     if hypr_reload_check; then
         echo -e "    ${CHECKED}✓${RESET}  Monitor layout applied"
         SUMMARY_LOG+=("✓  Monitor layout configured")
     else
         SUMMARY_LOG+=("✗  Monitor layout -- Hyprland reported config errors")
+        rc=1
     fi
     echo
     echo
+    return "$rc"
 }
 
 # Enable laptop auto-off (disable laptop screen when external connected)
@@ -2006,11 +2232,14 @@ setup_laptop_auto_off() {
     echo
 
     # Create scripts directory
-    mkdir -p "$(dirname "$LAPTOP_AUTO_SCRIPT")"
+    if ! mkdir -p "$(dirname "$LAPTOP_AUTO_SCRIPT")"; then
+        SUMMARY_LOG+=("✗  Laptop auto-off -- failed (could not create the scripts directory)")
+        return 1
+    fi
 
     # Detect the backlight device for this laptop
     local backlight_dev=""
-    for bl in /sys/class/backlight/*/; do
+    for bl in "$BACKLIGHT_DIR"/*/; do
         [[ -d "$bl" ]] || continue
         local bl_name="${bl%/}"
         bl_name="${bl_name##*/}"
@@ -2020,7 +2249,7 @@ setup_laptop_auto_off() {
     done
 
     if [[ -z "$backlight_dev" ]]; then
-        echo -e "  ${DIM}✗${RESET}  No backlight device found in /sys/class/backlight/"
+        echo -e "  ${DIM}✗${RESET}  No backlight device found in $BACKLIGHT_DIR/"
         echo
         SUMMARY_LOG+=("✗  Laptop auto-off -- no backlight device found")
         return 1
@@ -2100,12 +2329,19 @@ fi | while read -r line; do
     esac
 done
 SCRIPTEOF
-
-    chmod +x "$LAPTOP_AUTO_SCRIPT"
+    if [[ $? != 0 ]] || ! chmod +x "$LAPTOP_AUTO_SCRIPT"; then
+        echo -e "    ${DIM}✗${RESET}  Could not write the watcher script"
+        SUMMARY_LOG+=("✗  Laptop auto-off -- failed (watcher script not written)")
+        return 1
+    fi
     echo -e "    ${CHECKED}✓${RESET}  Watcher script created: $LAPTOP_AUTO_SCRIPT"
 
     # Start the watcher with Hyprland
-    lua_block_write "$AUTOSTART_LUA" "laptop-display" "$(lua_on_start "$LAPTOP_AUTO_SCRIPT")"
+    if [[ ! -f "$AUTOSTART_LUA" ]] || ! lua_block_write "$AUTOSTART_LUA" "laptop-display" "$(lua_on_start "$LAPTOP_AUTO_SCRIPT")"; then
+        echo -e "    ${DIM}✗${RESET}  Could not add the startup entry to autostart.lua"
+        SUMMARY_LOG+=("✗  Laptop auto-off -- failed (autostart.lua not updated; the watcher was not started)")
+        return 1
+    fi
     echo -e "    ${CHECKED}✓${RESET}  Added startup entry to autostart.lua"
 
     # Start the script now (startup entries only run when Hyprland starts)
@@ -2127,7 +2363,11 @@ remove_laptop_auto_off() {
     echo
 
     if lua_block_has "$AUTOSTART_LUA" "laptop-display"; then
-        lua_block_remove "$AUTOSTART_LUA" "laptop-display"
+        if ! lua_block_remove "$AUTOSTART_LUA" "laptop-display"; then
+            echo -e "    ${DIM}✗${RESET}  Could not remove the startup entry from autostart.lua"
+            SUMMARY_LOG+=("✗  Laptop auto-off -- failed to remove the startup entry; nothing else was changed")
+            return 1
+        fi
         echo -e "    ${CHECKED}✓${RESET}  Removed startup entry from autostart.lua"
     fi
 
@@ -2141,7 +2381,7 @@ remove_laptop_auto_off() {
     pkill -f "laptop-display-auto.sh" 2>/dev/null
 
     # Restore backlight (find the backlight device)
-    for bl in /sys/class/backlight/*/; do
+    for bl in "$BACKLIGHT_DIR"/*/; do
         [[ -d "$bl" ]] || continue
         local bl_name="${bl%/}"
         bl_name="${bl_name##*/}"
@@ -2301,17 +2541,27 @@ apply_primary_monitor() {
     done
     hyprctl dispatch 'hl.dsp.focus({ workspace = "1" })' &>/dev/null
 
-    backup_file "$MONITORS_LUA"
-    lua_block_write "$MONITORS_LUA" "primary-monitor" "${block%$'\n'}"
+    if ! backup_file "$MONITORS_LUA"; then
+        SUMMARY_LOG+=("✗  Primary monitor -- failed (backup failed)")
+        return 1
+    fi
+    if ! lua_block_write "$MONITORS_LUA" "primary-monitor" "${block%$'\n'}"; then
+        echo -e "    ${DIM}✗${RESET}  Could not write the workspace rules to monitors.lua"
+        SUMMARY_LOG+=("✗  Primary monitor -- failed (config write failed)")
+        return 1
+    fi
     echo -e "    ${CHECKED}✓${RESET}  Workspace rules written to monitors.lua"
 
+    local rc=0
     if hypr_reload_check; then
         SUMMARY_LOG+=("✓  Primary monitor set to $SELECTED_PRIMARY_MONITOR")
     else
         SUMMARY_LOG+=("✗  Primary monitor -- Hyprland reported config errors")
+        rc=1
     fi
     echo
     echo
+    return "$rc"
 }
 
 # Show power profile selection dialog
@@ -2414,6 +2664,11 @@ apply_power_profile() {
     echo -e "${BOLD}  Set Power Profile: $SELECTED_POWER_PROFILE${RESET}"
     echo
 
+    case "$SELECTED_POWER_PROFILE" in
+        power-saver|balanced|performance) ;;
+        *) SUMMARY_LOG+=("✗  Power profile -- invalid profile"); return 1 ;;
+    esac
+
     # Set profile immediately
     if powerprofilesctl set "$SELECTED_POWER_PROFILE" 2>/dev/null; then
         echo -e "    ${CHECKED}✓${RESET}  Profile set to $SELECTED_POWER_PROFILE"
@@ -2423,20 +2678,22 @@ apply_power_profile() {
         return 1
     fi
 
-    # Create scripts directory
-    mkdir -p "$(dirname "$POWER_PROFILE_SCRIPT")"
-
-    # Write startup script
-    cat > "$POWER_PROFILE_SCRIPT" << SCRIPTEOF
-#!/bin/bash
-# Managed by A La Carchy - default power profile on startup
-powerprofilesctl set $SELECTED_POWER_PROFILE
-SCRIPTEOF
-
-    chmod +x "$POWER_PROFILE_SCRIPT"
+    # Write the startup script that restores the profile at login
+    if ! mkdir -p "$(dirname "$POWER_PROFILE_SCRIPT")" ||
+       ! printf '%s\n' '#!/bin/bash' '# Managed by A La Carchy - default power profile on startup' \
+            "powerprofilesctl set $SELECTED_POWER_PROFILE" > "$POWER_PROFILE_SCRIPT" ||
+       ! chmod +x "$POWER_PROFILE_SCRIPT"; then
+        echo -e "    ${DIM}✗${RESET}  Could not write the startup script"
+        SUMMARY_LOG+=("✗  Power profile -- set now, but the startup script could not be written (not persistent)")
+        return 1
+    fi
     echo -e "    ${CHECKED}✓${RESET}  Startup script created: $POWER_PROFILE_SCRIPT"
 
-    lua_block_write "$AUTOSTART_LUA" "power-profile" "$(lua_on_start "$POWER_PROFILE_SCRIPT")"
+    if [[ ! -f "$AUTOSTART_LUA" ]] || ! lua_block_write "$AUTOSTART_LUA" "power-profile" "$(lua_on_start "$POWER_PROFILE_SCRIPT")"; then
+        echo -e "    ${DIM}✗${RESET}  Could not add the startup entry to autostart.lua"
+        SUMMARY_LOG+=("✗  Power profile -- set now, but autostart.lua could not be updated (not persistent)")
+        return 1
+    fi
     echo -e "    ${CHECKED}✓${RESET}  Added startup entry to autostart.lua"
 
     # Sync asusd platform profile if asusd is present (prevents it overriding powerprofilesctl)
@@ -2450,15 +2707,20 @@ SCRIPTEOF
         esac
 
         if [[ -n "$asus_profile" ]]; then
-            if sudo sed -i \
+            if sudo /usr/bin/sed -i \
                 -e "s/^\([[:space:]]*\)platform_profile_on_ac: [^,]*/\1platform_profile_on_ac: $asus_profile/" \
                 -e "s/^\([[:space:]]*\)platform_profile_on_battery: [^,]*/\1platform_profile_on_battery: $asus_profile/" \
                 "$asusd_config" 2>/dev/null; then
-                sudo systemctl restart asusd 2>/dev/null
+                if ! sudo /usr/bin/systemctl restart asusd 2>/dev/null; then
+                    echo -e "    ${DIM}✗${RESET}  asusd config updated, but restarting asusd failed"
+                    SUMMARY_LOG+=("✗  Power profile -- asusd config updated, restart failed")
+                    return 1
+                fi
                 echo -e "    ${CHECKED}✓${RESET}  Updated asusd to enforce $asus_profile profile"
             else
                 echo -e "    ${DIM}✗${RESET}  Could not update asusd config (sudo required)"
                 SUMMARY_LOG+=("✗  Power profile -- failed to update asusd config")
+                return 1
             fi
         fi
     fi
@@ -2471,6 +2733,12 @@ SCRIPTEOF
 # =============================================================================
 # POWER PROFILE AUTO-SWITCH
 # =============================================================================
+
+# Dialog selections. Assigned here (never inherited from the environment) so an
+# exported variable cannot queue a privileged change the user did not pick.
+SELECTED_POWER_AUTO_SWITCH=""
+SELECTED_POWER_AC_PROFILE=""
+SELECTED_POWER_BATTERY_PROFILE=""
 
 # Helper: show a profile picker sub-dialog; stores result in PICK_RESULT
 _pick_auto_switch_profile() {
@@ -2536,18 +2804,16 @@ show_power_auto_switch_dialog() {
         return
     fi
 
-    # Read current configured state from our script if it exists
+    # Prefer metadata in the root-owned rule; only read (never execute) a
+    # legacy user script when migrating from the previous implementation.
     local cur_ac="performance"
     local cur_bat="balanced"
     local cur_enabled=0  # 0=enabled, 1=disabled
-
-    if [[ -f "$POWER_AUTO_SWITCH_SCRIPT" ]]; then
-        local parsed_ac parsed_bat
-        parsed_ac=$(grep -oP 'PROFILE_AC="\K[^"]+' "$POWER_AUTO_SWITCH_SCRIPT" 2>/dev/null)
-        parsed_bat=$(grep -oP 'PROFILE_BATTERY="\K[^"]+' "$POWER_AUTO_SWITCH_SCRIPT" 2>/dev/null)
-        [[ -n "$parsed_ac" ]] && cur_ac="$parsed_ac"
-        [[ -n "$parsed_bat" ]] && cur_bat="$parsed_bat"
-    fi
+    local parsed_ac parsed_bat
+    parsed_ac=$(power_auto_switch_configured_profile AC) || parsed_ac=""
+    parsed_bat=$(power_auto_switch_configured_profile BATTERY) || parsed_bat=""
+    [[ -n "$parsed_ac" ]] && cur_ac="$parsed_ac"
+    [[ -n "$parsed_bat" ]] && cur_bat="$parsed_bat"
 
     # Disabled if udev rule is missing or marked disabled
     if [[ ! -f "$POWER_AUTO_SWITCH_UDEV_RULE" ]]; then
@@ -2565,12 +2831,18 @@ show_power_auto_switch_dialog() {
     local form_ac="$cur_ac"
     local form_bat="$cur_bat"
     local form_cursor=0  # 0=enabled toggle, 1=ac profile, 2=battery profile, 3=confirm
+    # A rule from the previous implementation runs a HOME script as root.
+    local legacy_notice=""
+    if power_auto_switch_rule_owned && ! power_auto_switch_rule_safe; then
+        legacy_notice="Existing rule is not the verified root-only rule (legacy versions ran a user script as root). Confirm to replace it, or disable to remove it."
+    fi
 
     while true; do
         clear
         echo
         echo -e "  ${BOLD}Power Profile Auto-Switch${RESET}"
         echo -e "  ${DIM}Configure profiles used when AC power is connected or disconnected${RESET}"
+        [[ -n "$legacy_notice" ]] && echo -e "  ${C_MODIFIED}${legacy_notice}${RESET}"
         echo
         echo -e "  ${DIM}Up/Down: navigate  Enter: change  Esc: cancel${RESET}"
         echo
@@ -2673,6 +2945,190 @@ show_power_auto_switch_dialog() {
     done
 }
 
+power_auto_switch_configured_profile() {
+    local key="$1" file profile
+    case "$key" in AC|BATTERY) ;; *) return 1 ;; esac
+    for file in "$POWER_AUTO_SWITCH_UDEV_RULE" "$POWER_AUTO_SWITCH_SCRIPT"; do
+        [[ -f "$file" ]] || continue
+        profile=$(/usr/bin/grep -m1 -oP "^(?:# )?PROFILE_${key}=\"\\K[^\"]+" "$file" 2>/dev/null) || continue
+        case "$profile" in
+            power-saver|balanced|performance) printf '%s\n' "$profile"; return 0 ;;
+            *) return 1 ;;
+        esac
+    done
+    return 1
+}
+
+# Privileged-state predicates are deliberately separate from installation so
+# fixture tests can model root ownership without ever using real sudo.
+power_auto_switch_metadata() {
+    /usr/bin/stat -c '%u %a' -- "$1" 2>/dev/null
+}
+
+power_auto_switch_root_metadata_safe() {
+    local info owner mode
+    info=$(power_auto_switch_metadata "$1") || return 1
+    read -r owner mode <<< "$info"
+    [[ "$owner" == 0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 0022) == 0 ))
+}
+
+power_auto_switch_trusted_directory() {
+    local dir="$1"
+    [[ "$dir" == /* ]] || return 1
+    while :; do
+        [[ -d "$dir" && ! -L "$dir" ]] || return 1
+        power_auto_switch_root_metadata_safe "$dir" || return 1
+        [[ "$dir" == / ]] && return 0
+        dir="${dir%/*}"
+        [[ -n "$dir" ]] || dir=/
+    done
+}
+
+# A root rule may only run a root-owned, non-writable regular file reached
+# through root-owned, non-writable directories. Symlinks are refused rather
+# than trusting a resolved target whose intermediate links could later change.
+power_auto_switch_trusted_executable() {
+    local path="$1"
+    [[ "$path" == /* && -f "$path" && -x "$path" && ! -L "$path" ]] &&
+        power_auto_switch_root_metadata_safe "$path" &&
+        power_auto_switch_trusted_directory "${path%/*}"
+}
+
+# The one program the rendered rule runs. This is a fail-closed system path.
+power_auto_switch_backend_available() {
+    power_auto_switch_trusted_executable /usr/bin/powerprofilesctl
+}
+
+power_auto_switch_render_rule() {
+    local ac="$1" battery="$2" profile
+    for profile in "$ac" "$battery"; do
+        case "$profile" in power-saver|balanced|performance) ;; *) return 1 ;; esac
+    done
+    printf '%s\n' \
+        '# Managed by A La Carchy - power profile auto-switch' \
+        "# PROFILE_AC=\"$ac\"" "# PROFILE_BATTERY=\"$battery\"" \
+        "ACTION==\"change\", SUBSYSTEM==\"power_supply\", ATTR{type}==\"Mains\", ATTR{online}==\"1\", RUN+=\"/usr/bin/powerprofilesctl set $ac\"" \
+        "ACTION==\"change\", SUBSYSTEM==\"power_supply\", ATTR{type}==\"Mains\", ATTR{online}==\"0\", RUN+=\"/usr/bin/powerprofilesctl set $battery\""
+}
+
+power_auto_switch_rule_owned() {
+    [[ -f "$POWER_AUTO_SWITCH_UDEV_RULE" ]] &&
+        /usr/bin/grep -qFx '# Managed by A La Carchy - power profile auto-switch' "$POWER_AUTO_SWITCH_UDEV_RULE" 2>/dev/null
+}
+
+power_auto_switch_rule_safe() {
+    local ac battery
+    [[ -f "$POWER_AUTO_SWITCH_UDEV_RULE" && ! -L "$POWER_AUTO_SWITCH_UDEV_RULE" ]] || return 1
+    power_auto_switch_root_metadata_safe "$POWER_AUTO_SWITCH_UDEV_RULE" || return 1
+    ac=$(power_auto_switch_configured_profile AC) || return 1
+    battery=$(power_auto_switch_configured_profile BATTERY) || return 1
+    /usr/bin/cmp -s -- "$POWER_AUTO_SWITCH_UDEV_RULE" <(power_auto_switch_render_rule "$ac" "$battery")
+}
+
+power_auto_switch_failure() {
+    echo -e "    ${DIM}✗${RESET}  Power auto-switch -- $1"
+    SUMMARY_LOG+=("✗  Power auto-switch -- $1")
+    if power_auto_switch_rule_safe; then
+        SUMMARY_LOG+=("✗  Verified managed rule remains; udev may use previously loaded rules until a successful reload.")
+    elif [[ -e "$POWER_AUTO_SWITCH_UDEV_RULE" || -L "$POWER_AUTO_SWITCH_UDEV_RULE" ]]; then
+        SUMMARY_LOG+=("✗  Existing root rule remains; its loaded state is not confirmed. Legacy/untrusted rules may still execute as root; disable or review manually.")
+    fi
+    return 1
+}
+
+power_auto_switch_retire_rule() {
+    if [[ -e "$POWER_AUTO_SWITCH_UDEV_RULE" || -L "$POWER_AUTO_SWITCH_UDEV_RULE" ]]; then
+        power_auto_switch_rule_owned || {
+            power_auto_switch_failure 'unrecognized rule entry preserved; manual review required'
+            return 1
+        }
+        if ! sudo /usr/bin/rm -f -- "$POWER_AUTO_SWITCH_UDEV_RULE" 2>/dev/null; then
+            power_auto_switch_failure 'failed to remove managed rule'
+            return 1
+        fi
+        if [[ -e "$POWER_AUTO_SWITCH_UDEV_RULE" || -L "$POWER_AUTO_SWITCH_UDEV_RULE" ]]; then
+            power_auto_switch_failure 'removal not confirmed'
+            return 1
+        fi
+    fi
+    # Always reload, including retries after a removal whose reload failed.
+    if ! sudo /usr/bin/udevadm control --reload-rules 2>/dev/null; then
+        power_auto_switch_failure 'rule absent, reload failed; prior root rule may remain loaded'
+        return 1
+    fi
+}
+
+power_auto_switch_install_rule() {
+    local dir="${POWER_AUTO_SWITCH_UDEV_RULE%/*}" stage name rendered
+    # Render once: the bytes written, compared and promoted are the same, and
+    # an unlisted profile stops here instead of staging an empty rule.
+    rendered=$(power_auto_switch_render_rule "$SELECTED_POWER_AC_PROFILE" "$SELECTED_POWER_BATTERY_PROFILE") || {
+        power_auto_switch_failure 'invalid profile; no privileged changes'
+        return 1
+    }
+    # mktemp runs as root INSIDE the trusted destination directory. Never hand
+    # sudo a user-writable HOME/tmp script, staging file, or destination target.
+    stage=$(sudo /usr/bin/mktemp -- "$dir/.a-la-carchy-power.XXXXXXXX" 2>/dev/null) || {
+        power_auto_switch_failure 'failed to create root-owned staging file'
+        return 1
+    }
+    name="${stage#"$dir/"}"
+    if [[ "$stage" != "$dir/"* || "$name" != .a-la-carchy-power.* || "$name" == */* || ! -f "$stage" || -L "$stage" ]] ||
+       ! power_auto_switch_root_metadata_safe "$stage"; then
+        # Do not remove an unverified path returned by a failed/misconfigured
+        # elevation command. A hidden staging file is not a loadable .rules file.
+        power_auto_switch_failure 'untrusted staging path; no promotion, manual cleanup may be needed'
+        return 1
+    fi
+    if ! printf '%s\n' "$rendered" | sudo /usr/bin/tee -- "$stage" >/dev/null 2>&1 ||
+       ! sudo /usr/bin/chown 0:0 -- "$stage" 2>/dev/null ||
+       ! sudo /usr/bin/chmod 0644 -- "$stage" 2>/dev/null ||
+       [[ "$(power_auto_switch_metadata "$stage")" != '0 644' ]] ||
+       ! /usr/bin/cmp -s -- "$stage" <(printf '%s\n' "$rendered"); then
+        sudo /usr/bin/rm -f -- "$stage" 2>/dev/null || SUMMARY_LOG+=("✗  Root staging cleanup failed; hidden temporary file remains")
+        power_auto_switch_failure 'staging write/ownership/mode verification failed; destination not promoted'
+        return 1
+    fi
+    # Preserve foreign destinations that appeared while staging. A trusted
+    # root-owned directory prevents unprivileged destination replacement races.
+    if [[ -e "$POWER_AUTO_SWITCH_UDEV_RULE" || -L "$POWER_AUTO_SWITCH_UDEV_RULE" ]] && ! power_auto_switch_rule_safe; then
+        sudo /usr/bin/rm -f -- "$stage" 2>/dev/null || SUMMARY_LOG+=("✗  Root staging cleanup failed; hidden temporary file remains")
+        power_auto_switch_failure 'destination changed to an untrusted rule; promotion refused'
+        return 1
+    fi
+    if ! sudo /usr/bin/mv -f -T -- "$stage" "$POWER_AUTO_SWITCH_UDEV_RULE" 2>/dev/null; then
+        sudo /usr/bin/rm -f -- "$stage" 2>/dev/null || SUMMARY_LOG+=("✗  Root staging cleanup failed; hidden temporary file remains")
+        power_auto_switch_failure 'atomic promotion failed'
+        return 1
+    fi
+    if [[ -e "$stage" || -L "$stage" ]] ||
+       [[ "$(power_auto_switch_metadata "$POWER_AUTO_SWITCH_UDEV_RULE")" != '0 644' ]] ||
+       ! power_auto_switch_rule_safe ||
+       ! /usr/bin/cmp -s -- "$POWER_AUTO_SWITCH_UDEV_RULE" <(printf '%s\n' "$rendered"); then
+        [[ ! -e "$stage" && ! -L "$stage" ]] || sudo /usr/bin/rm -f -- "$stage" 2>/dev/null || SUMMARY_LOG+=("✗  Root staging cleanup failed")
+        # Fail closed: udev also picks up changed rule files without an explicit
+        # reload, so an unverified rule is taken back out rather than left
+        # loadable. It is reloaded only once it is confirmed gone. A rule that
+        # still verifies (the previous one, if the rename did nothing) stays.
+        if power_auto_switch_rule_safe; then
+            power_auto_switch_failure 'promotion not verified; no reload or success reported'
+        elif power_auto_switch_rule_owned && sudo /usr/bin/rm -f -- "$POWER_AUTO_SWITCH_UDEV_RULE" 2>/dev/null &&
+           [[ ! -e "$POWER_AUTO_SWITCH_UDEV_RULE" && ! -L "$POWER_AUTO_SWITCH_UDEV_RULE" ]]; then
+            sudo /usr/bin/udevadm control --reload-rules 2>/dev/null ||
+                SUMMARY_LOG+=("✗  udev reload failed after removing the unverified rule; previously loaded rules may still apply")
+            power_auto_switch_failure 'promotion not verified; unverified rule removed, auto-switching is off'
+        else
+            power_auto_switch_failure 'promotion not verified; no reload or success reported'
+        fi
+        return 1
+    fi
+    if ! sudo /usr/bin/udevadm control --reload-rules 2>/dev/null; then
+        power_auto_switch_failure 'safe rule installed, reload failed; previous loaded configuration may still apply'
+        return 1
+    fi
+}
+
 apply_power_auto_switch() {
     clear
     echo
@@ -2680,50 +3136,45 @@ apply_power_auto_switch() {
     echo -e "${BOLD}  Power Profile Auto-Switch${RESET}"
     echo
 
+    case "$SELECTED_POWER_AUTO_SWITCH" in
+        enabled|disabled) ;;
+        *) power_auto_switch_failure 'invalid selection'; return 1 ;;
+    esac
+    if ! power_auto_switch_trusted_directory "${POWER_AUTO_SWITCH_UDEV_RULE%/*}"; then
+        power_auto_switch_failure 'rules directory is not a trusted root-owned directory; no privileged changes'
+        return 1
+    fi
     if [[ "$SELECTED_POWER_AUTO_SWITCH" == "disabled" ]]; then
-        if [[ -f "$POWER_AUTO_SWITCH_UDEV_RULE" ]]; then
-            if sudo rm -f "$POWER_AUTO_SWITCH_UDEV_RULE" 2>/dev/null; then
-                sudo udevadm control --reload-rules 2>/dev/null
-                echo -e "    ${CHECKED}✓${RESET}  Udev rule removed — auto-switching disabled"
-            else
-                echo -e "    ${DIM}✗${RESET}  Failed to remove udev rule"
-                SUMMARY_LOG+=("✗  Power auto-switch -- failed to disable")
+        power_auto_switch_retire_rule || return 1
+        echo -e "    ${CHECKED}✓${RESET}  Managed rule absent and udev reload succeeded"
+        SUMMARY_LOG+=("✓  Power auto-switch disabled")
+    elif [[ "$SELECTED_POWER_AUTO_SWITCH" == "enabled" ]]; then
+        local profile backend_ok=0
+        for profile in "$SELECTED_POWER_AC_PROFILE" "$SELECTED_POWER_BATTERY_PROFILE"; do
+            case "$profile" in
+                power-saver|balanced|performance) ;;
+                *) power_auto_switch_failure 'invalid profile; no privileged changes'; return 1 ;;
+            esac
+        done
+        power_auto_switch_backend_available && backend_ok=1
+        if [[ -e "$POWER_AUTO_SWITCH_UDEV_RULE" || -L "$POWER_AUTO_SWITCH_UDEV_RULE" ]]; then
+            if ! power_auto_switch_rule_owned; then
+                power_auto_switch_failure 'foreign/nonregular rule entry preserved; enable refused'
                 return 1
             fi
-        else
-            echo -e "    ${CHECKED}✓${RESET}  Auto-switching already disabled"
+            # Retire recognized legacy, writable, noncanonical, or symlinked
+            # rules BEFORE attempting to enable. A missing/untrusted backend
+            # also requires retirement, even if the old rule text was canonical.
+            if [[ "$backend_ok" == 0 ]] || ! power_auto_switch_rule_safe; then
+                power_auto_switch_retire_rule || return 1
+            fi
         fi
-        SUMMARY_LOG+=("✓  Power auto-switch disabled")
-    else
-        # Create the auto-switch script
-        mkdir -p "$(dirname "$POWER_AUTO_SWITCH_SCRIPT")"
-        {
-            echo '#!/bin/bash'
-            echo "# Managed by A La Carchy - power profile auto-switch"
-            echo "PROFILE_AC=\"$SELECTED_POWER_AC_PROFILE\""
-            echo "PROFILE_BATTERY=\"$SELECTED_POWER_BATTERY_PROFILE\""
-            echo ""
-            echo 'case "$1" in'
-            echo '    ac)      /usr/bin/powerprofilesctl set "$PROFILE_AC" ;;'
-            echo '    battery) /usr/bin/powerprofilesctl set "$PROFILE_BATTERY" ;;'
-            echo 'esac'
-        } > "$POWER_AUTO_SWITCH_SCRIPT"
-        chmod +x "$POWER_AUTO_SWITCH_SCRIPT"
-        echo -e "    ${CHECKED}✓${RESET}  Auto-switch script created: $POWER_AUTO_SWITCH_SCRIPT"
-
-        # Write udev rule pointing to our script
-        if {
-            echo "# Managed by A La Carchy - power profile auto-switch"
-            echo "ACTION==\"change\", SUBSYSTEM==\"power_supply\", KERNEL==\"AC*\", ATTR{online}==\"1\", RUN+=\"${POWER_AUTO_SWITCH_SCRIPT} ac\""
-            echo "ACTION==\"change\", SUBSYSTEM==\"power_supply\", KERNEL==\"AC*\", ATTR{online}==\"0\", RUN+=\"${POWER_AUTO_SWITCH_SCRIPT} battery\""
-        } | sudo tee "$POWER_AUTO_SWITCH_UDEV_RULE" > /dev/null 2>&1; then
-            sudo udevadm control --reload-rules 2>/dev/null
-            echo -e "    ${CHECKED}✓${RESET}  Udev rule installed: $POWER_AUTO_SWITCH_UDEV_RULE"
-        else
-            echo -e "    ${DIM}✗${RESET}  Failed to write udev rule (sudo required)"
-            SUMMARY_LOG+=("✗  Power auto-switch -- failed to write udev rule")
+        if [[ "$backend_ok" == 0 ]]; then
+            power_auto_switch_failure '/usr/bin/powerprofilesctl unavailable or untrusted; no rule enabled'
             return 1
         fi
+        power_auto_switch_install_rule || return 1
+        echo -e "    ${CHECKED}✓${RESET}  Verified root-owned udev rule installed: $POWER_AUTO_SWITCH_UDEV_RULE"
 
         # Sync asusd platform profiles if asusd is present (prevents it overriding powerprofilesctl)
         local asusd_config="/etc/asusd/asusd.ron"
@@ -2741,20 +3192,28 @@ apply_power_auto_switch() {
             esac
 
             if [[ -n "$asus_ac" && -n "$asus_bat" ]]; then
-                if sudo sed -i \
+                if sudo /usr/bin/sed -i \
                     -e "s/^\([[:space:]]*\)platform_profile_on_ac: [^,]*/\1platform_profile_on_ac: $asus_ac/" \
                     -e "s/^\([[:space:]]*\)platform_profile_on_battery: [^,]*/\1platform_profile_on_battery: $asus_bat/" \
                     "$asusd_config" 2>/dev/null; then
-                    sudo systemctl restart asusd 2>/dev/null
+                    if ! sudo /usr/bin/systemctl restart asusd 2>/dev/null; then
+                        echo -e "    ${DIM}✗${RESET}  asusd config updated, but restarting asusd failed"
+                        SUMMARY_LOG+=("✗  Power auto-switch -- udev rule installed; asusd config updated, but its restart failed (asusd may override profiles)")
+                        return 1
+                    fi
                     echo -e "    ${CHECKED}✓${RESET}  Updated asusd: AC=$asus_ac, battery=$asus_bat"
                 else
                     echo -e "    ${DIM}✗${RESET}  Could not update asusd config (sudo required)"
-                    SUMMARY_LOG+=("✗  Power auto-switch -- failed to update asusd config")
+                    SUMMARY_LOG+=("✗  Power auto-switch -- udev rule installed; asusd config update failed (asusd may override profiles)")
+                    return 1
                 fi
             fi
         fi
 
         SUMMARY_LOG+=("✓  Power auto-switch: AC=$SELECTED_POWER_AC_PROFILE, battery=$SELECTED_POWER_BATTERY_PROFILE")
+    else
+        SUMMARY_LOG+=("✗  Power auto-switch -- invalid selection")
+        return 1
     fi
     echo
     echo
@@ -2763,7 +3222,7 @@ apply_power_auto_switch() {
 show_battery_limit_dialog() {
     # Auto-detect battery device with charge limit support
     local bat_threshold=""
-    for path in /sys/class/power_supply/BAT*/charge_control_end_threshold; do
+    for path in "$POWER_SUPPLY_DIR"/BAT*/charge_control_end_threshold; do
         [[ -f "$path" ]] && { bat_threshold="$path"; break; }
     done
 
@@ -2871,6 +3330,11 @@ apply_battery_limit() {
     echo -e "${BOLD}  Set Battery Charge Limit: ${SELECTED_BATTERY_LIMIT}%${RESET}"
     echo
 
+    case "$SELECTED_BATTERY_LIMIT" in
+        60|70|80|90|100) ;;
+        *) SUMMARY_LOG+=("✗  Battery charge limit -- invalid value"); return 1 ;;
+    esac
+
     # Request sudo credentials
     if ! sudo -n true 2>/dev/null; then
         echo -e "  ${DIM}Sudo access required to set charge limit...${RESET}"
@@ -2883,12 +3347,12 @@ apply_battery_limit() {
 
     # Find battery threshold path
     local bat_threshold=""
-    for path in /sys/class/power_supply/BAT*/charge_control_end_threshold; do
+    for path in "$POWER_SUPPLY_DIR"/BAT*/charge_control_end_threshold; do
         [[ -f "$path" ]] && { bat_threshold="$path"; break; }
     done
 
     # Apply immediately
-    if echo "$SELECTED_BATTERY_LIMIT" | sudo tee "$bat_threshold" > /dev/null 2>&1; then
+    if [[ -n "$bat_threshold" ]] && echo "$SELECTED_BATTERY_LIMIT" | sudo /usr/bin/tee -- "$bat_threshold" > /dev/null 2>&1; then
         echo -e "    ${CHECKED}✓${RESET}  Charge limit set to ${SELECTED_BATTERY_LIMIT}%"
     else
         echo -e "    ${DIM}✗${RESET}  Failed to set charge limit"
@@ -2900,7 +3364,11 @@ apply_battery_limit() {
     if [[ "$SELECTED_BATTERY_LIMIT" == "100" ]]; then
         # No limit - remove udev rule if it exists
         if [[ -f "$BATTERY_LIMIT_UDEV_RULE" ]]; then
-            sudo rm -f "$BATTERY_LIMIT_UDEV_RULE"
+            if ! sudo /usr/bin/rm -f -- "$BATTERY_LIMIT_UDEV_RULE" || [[ -e "$BATTERY_LIMIT_UDEV_RULE" ]]; then
+                echo -e "    ${DIM}✗${RESET}  Failed to remove udev rule"
+                SUMMARY_LOG+=("✗  Battery charge limit -- limit set now, but the persistent udev rule could not be removed")
+                return 1
+            fi
             echo -e "    ${CHECKED}✓${RESET}  Removed udev rule (no limit)"
         fi
 
@@ -2916,19 +3384,34 @@ apply_battery_limit() {
         fi
     else
         # Write udev rule for persistence
-        printf '# Managed by A La Carchy - battery charge limit\nSUBSYSTEM=="power_supply", KERNEL=="BAT*", ATTR{charge_control_end_threshold}="%s"\n' \
-            "$SELECTED_BATTERY_LIMIT" | sudo tee "$BATTERY_LIMIT_UDEV_RULE" > /dev/null
+        if ! printf '# Managed by A La Carchy - battery charge limit\nSUBSYSTEM=="power_supply", KERNEL=="BAT*", ATTR{charge_control_end_threshold}="%s"\n' \
+            "$SELECTED_BATTERY_LIMIT" | sudo /usr/bin/tee -- "$BATTERY_LIMIT_UDEV_RULE" > /dev/null; then
+            echo -e "    ${DIM}✗${RESET}  Failed to write udev rule"
+            SUMMARY_LOG+=("✗  Battery charge limit -- limit set now, but it will not persist (udev rule write failed)")
+            return 1
+        fi
         echo -e "    ${CHECKED}✓${RESET}  Udev rule written: $BATTERY_LIMIT_UDEV_RULE"
     fi
 
     # Reload udev rules
-    sudo udevadm control --reload-rules 2>/dev/null
+    if ! sudo /usr/bin/udevadm control --reload-rules 2>/dev/null; then
+        echo -e "    ${DIM}✗${RESET}  Failed to reload udev rules"
+        SUMMARY_LOG+=("✗  Battery charge limit -- limit set now, but udev rules were not reloaded")
+        return 1
+    fi
     echo -e "    ${CHECKED}✓${RESET}  Udev rules reloaded"
 
     # Install helper script and the Omarchy menu charge-limit picker
     if [[ "$SELECTED_BATTERY_LIMIT" != "100" ]]; then
-        install_battery_limit_helper
-        install_power_menu_override
+        if ! install_battery_limit_helper; then
+            SUMMARY_LOG+=("✗  Battery charge limit -- set to ${SELECTED_BATTERY_LIMIT}%, but the menu helper could not be installed")
+            return 1
+        fi
+        if ! install_power_menu_override; then
+            echo -e "    ${DIM}✗${RESET}  Could not add the charge limit picker to $MENU_JSONC"
+            SUMMARY_LOG+=("✗  Battery charge limit -- set to ${SELECTED_BATTERY_LIMIT}%, but the Omarchy menu picker could not be added")
+            return 1
+        fi
     fi
 
     SUMMARY_LOG+=("✓  Battery charge limit set to ${SELECTED_BATTERY_LIMIT}%")
@@ -2941,7 +3424,7 @@ apply_battery_limit() {
 install_battery_limit_helper() {
     local script_dir
     script_dir="$(dirname "$BATTERY_LIMIT_HELPER")"
-    mkdir -p "$script_dir"
+    mkdir -p "$script_dir" || return 1
 
     cat > "$BATTERY_LIMIT_HELPER" << 'HELPEREOF'
 #!/bin/bash
@@ -2950,6 +3433,12 @@ install_battery_limit_helper() {
 
 LIMIT="${1:-80}"
 UDEV_RULE="/etc/udev/rules.d/99-battery-charge-limit.rules"
+
+# Only these values are ever interpolated into the privileged command below.
+case "$LIMIT" in
+    60|70|80|90|100) ;;
+    *) notify-send "Battery Limit" "Unsupported charge limit" -i dialog-error; exit 1 ;;
+esac
 
 # Find battery threshold path
 BAT_THRESHOLD=""
@@ -2984,8 +3473,9 @@ fi
 
 notify-send "Battery Limit" "Charge limit set to ${LIMIT}%" -i battery
 HELPEREOF
+    [[ $? == 0 ]] || return 1
 
-    chmod +x "$BATTERY_LIMIT_HELPER"
+    chmod +x "$BATTERY_LIMIT_HELPER" || return 1
     echo -e "    ${CHECKED}✓${RESET}  Battery limit helper installed: $BATTERY_LIMIT_HELPER"
 }
 
@@ -2994,23 +3484,39 @@ HELPEREOF
 POWER_MENU_MARKER_START="  // >>> a-la-carchy battery-limit"
 POWER_MENU_MARKER_END="  // <<< a-la-carchy battery-limit"
 
+# Insert a marked block right after the menu's opening brace, so it is always
+# followed by valid JSONC (the menu parser drops trailing commas).
+# Usage: menu_block_insert <start-line> <end-line> <body>
+menu_block_insert() {
+    local start="$1" end="$2" tmp rc=0
+    tmp=$(mktemp "${MENU_JSONC}.tmp.XXXXXX") || return 1
+    ALC_BODY="$3" awk -v s="$start" -v e="$end" '
+        !done && /^[[:space:]]*\{[[:space:]]*$/ { print; print s; print ENVIRON["ALC_BODY"]; print e; done = 1; next }
+        { print }
+    ' "$MENU_JSONC" > "$tmp" && cat "$tmp" > "$MENU_JSONC" || rc=1
+    rm -f -- "$tmp"
+    # No opening brace on a line of its own: nothing was inserted.
+    [[ "$rc" == 0 ]] && grep -qxF -- "$start" "$MENU_JSONC"
+}
+
+# Returns 1 when there is nothing to remove or the block could not be removed.
 remove_power_menu_override() {
     [[ -f "$MENU_JSONC" ]] && grep -qxF -- "$POWER_MENU_MARKER_START" "$MENU_JSONC" || return 1
-    awk -v s="$POWER_MENU_MARKER_START" -v e="$POWER_MENU_MARKER_END" '
-        $0 == s { skip = 1; next }
-        $0 == e { skip = 0; next }
-        !skip { print }
-    ' "$MENU_JSONC" > "${MENU_JSONC}.tmp" && mv "${MENU_JSONC}.tmp" "$MENU_JSONC"
+    marked_block_remove "$MENU_JSONC" "$POWER_MENU_MARKER_START" "$POWER_MENU_MARKER_END" keep-blank || return 1
     omarchy-menu refresh &>/dev/null || true
 }
 
 install_power_menu_override() {
-    mkdir -p "$(dirname "$MENU_JSONC")"
-    [[ -f "$MENU_JSONC" ]] || printf '{\n}\n' > "$MENU_JSONC"
-    remove_power_menu_override
+    mkdir -p "$(dirname "$MENU_JSONC")" || return 1
+    [[ -f "$MENU_JSONC" ]] || printf '{\n}\n' > "$MENU_JSONC" || return 1
+    # Replace an existing picker; a damaged block is left for the user to fix.
+    if grep -qxF -- "$POWER_MENU_MARKER_START" "$MENU_JSONC" && ! remove_power_menu_override; then
+        return 1
+    fi
 
     local threshold='cat /sys/class/power_supply/BAT*/charge_control_end_threshold 2>/dev/null | head -1'
-    local lines="" pct label
+    local lines="" pct label helper
+    printf -v helper '%q' "$BATTERY_LIMIT_HELPER"
     lines+="  \"setup.battery-limit\": $(jq -cn --arg when "[[ -n \"\$($threshold)\" ]]" \
         '{icon: "󰂄", label: "Battery Limit", aliases: ["charge-limit"], when: $when}'),"$'\n'
     for pct in 60 70 80 90 100; do
@@ -3021,14 +3527,11 @@ install_power_menu_override() {
             *)   label="${pct}%" ;;
         esac
         lines+="  \"setup.battery-limit.$pct\": $(jq -cn --arg label "$label" \
-            --arg checked "[[ \"\$($threshold)\" == $pct ]]" --arg action "$BATTERY_LIMIT_HELPER $pct" \
+            --arg checked "[[ \"\$($threshold)\" == $pct ]]" --arg action "$helper $pct" \
             '{icon: "󰁹", label: $label, checked: $checked, action: $action}'),"$'\n'
     done
 
-    ALC_BODY="${lines%$'\n'}" awk -v s="$POWER_MENU_MARKER_START" -v e="$POWER_MENU_MARKER_END" '
-        !done && /^[[:space:]]*\{[[:space:]]*$/ { print; print s; print ENVIRON["ALC_BODY"]; print e; done = 1; next }
-        { print }
-    ' "$MENU_JSONC" > "${MENU_JSONC}.tmp" && mv "${MENU_JSONC}.tmp" "$MENU_JSONC"
+    menu_block_insert "$POWER_MENU_MARKER_START" "$POWER_MENU_MARKER_END" "${lines%$'\n'}" || return 1
     omarchy-menu refresh &>/dev/null || true
 
     echo -e "    ${CHECKED}✓${RESET}  Charge limit picker added to Omarchy menu (Setup > Battery Limit)"
@@ -5159,6 +5662,136 @@ unbind_theme_menu() {
         "$BINDINGS_LUA" "theme-menu" "Unbound theme menu (ALT+T)"
 }
 
+# Print "file:line: keys" for each literal o.bind/o.bind_toggle/hl.bind on
+# SUPER+CTRL+LEFT/RIGHT, in any modifier order, alias or case: Hyprland runs every
+# bind on a key combo. Skips Lua comments and our own workspace-nav block.
+# With --omarchy, also skips binds our hl.unbind lines remove (hl.unbind matches
+# the key string itself, ignoring only spaces and case).
+workspace_nav_binds() {
+    local omarchy=0
+    [[ "$1" == --omarchy ]] && { omarchy=1; shift; }
+    awk -v omarchy="$omarchy" '
+        function canon_mod(t) {
+            if (t == "CTRL" || t == "CONTROL") return "CTRL"
+            if (t == "SUPER" || t == "WIN" || t == "LOGO" || t == "MOD4" || t == "META") return "SUPER"
+            if (t == "ALT" || t == "MOD1") return "ALT"
+            if (t == "SHIFT" || t == "CAPS" || t == "MOD2" || t == "MOD3" || t == "MOD5") return t
+            return ""
+        }
+        FNR == 1 { skip = 0 }
+        $0 == "-- >>> a-la-carchy workspace-nav" { skip = 1; next }
+        $0 == "-- <<< a-la-carchy workspace-nav" { skip = 0; next }
+        skip || /^[[:space:]]*--/ { next }
+        {
+            rest = $0
+            gsub(/\047/, "\"", rest)
+            while (match(rest, /(^|[^[:alnum:]_.])(o\.bind|o\.bind_toggle|hl\.bind)[[:space:]]*\([[:space:]]*"[^"]*"/)) {
+                keys = substr(rest, RSTART, RLENGTH)
+                rest = substr(rest, RSTART + RLENGTH)
+                sub(/^[^"]*"/, "", keys)
+                sub(/"$/, "", keys)
+
+                n = split(toupper(keys), parts, "+")
+                super = ctrl = other = 0
+                key = ""
+                for (i = 1; i <= n; i++) {
+                    t = parts[i]
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", t)
+                    m = canon_mod(t)
+                    if (m == "SUPER") super = 1
+                    else if (m == "CTRL") ctrl = 1
+                    else if (m != "") other = 1
+                    else key = t
+                }
+                if (!super || !ctrl || other) continue
+                if (key != "LEFT" && key != "RIGHT" && key != "CODE:113" && key != "CODE:114") continue
+
+                if (omarchy) {
+                    flat = tolower(keys)
+                    gsub(/ /, "", flat)
+                    if (flat == "super+ctrl+left" || flat == "super+ctrl+right") continue
+                }
+                file = FILENAME
+                sub(/.*\//, "", file)
+                print file ":" FNR ": " keys
+            }
+        }
+    ' "$@"
+}
+
+# Bindings that would fire together with HyDE workspace navigation: any of the
+# user's own on SUPER+CTRL+LEFT/RIGHT, and Omarchy defaults our hl.unbind misses
+workspace_nav_conflicts() {
+    local -a user_files=() omarchy_files=()
+    local f
+    for f in "$HYPR_DIR"/*.lua; do [[ -f "$f" ]] && user_files+=("$f"); done
+    for f in "$OMARCHY_DIR"/default/hypr/bindings/*.lua; do [[ -f "$f" ]] && omarchy_files+=("$f"); done
+    [[ ${#user_files[@]} -gt 0 ]] && workspace_nav_binds "${user_files[@]}"
+    [[ ${#omarchy_files[@]} -gt 0 ]] && workspace_nav_binds --omarchy "${omarchy_files[@]}"
+    return 0
+}
+
+# HyDE-style workspace arrows: SUPER+CTRL+LEFT/RIGHT focus the previous/next
+# workspace on the focused monitor ("r-1"/"r+1", same dispatcher as HyDE). Omarchy
+# binds these keys to grouped-window focus, which stays on SUPER+ALT+TAB and
+# SUPER+ALT+SHIFT+TAB, so those two binds are unbound first.
+enable_workspace_nav() {
+    local title="Enable HyDE Workspace Navigation"
+    local summary="Bound SUPER+CTRL+LEFT/RIGHT to previous/next workspace (HyDE)"
+    local conflicts
+    conflicts="$(workspace_nav_conflicts)"
+
+    if [[ -n "$conflicts" ]]; then
+        clear
+        echo
+        echo
+        echo -e "${BOLD}  $title${RESET}"
+        echo
+        echo -e "  ${DIM}✗${RESET}  SUPER+CTRL+LEFT/RIGHT is already bound here:"
+        echo
+        echo "$conflicts" | sed 's/^/       /'
+        echo
+        echo -e "  ${DIM}Move or remove those bindings first. Nothing was changed.${RESET}"
+        echo
+        SUMMARY_LOG+=("✗  HyDE workspace navigation -- skipped (SUPER+CTRL+LEFT/RIGHT already bound)")
+        return 1
+    fi
+
+    apply_lua_block "$title" \
+        "SUPER+CTRL+LEFT/RIGHT will switch to the previous/next workspace on the focused monitor, including empty ones (like HyDE). Grouped-window focus stays on SUPER+ALT+TAB / SUPER+ALT+SHIFT+TAB." \
+        "$BINDINGS_LUA" "workspace-nav" "$summary" \
+        'hl.unbind("SUPER + CTRL + LEFT")
+hl.unbind("SUPER + CTRL + RIGHT")
+o.bind("SUPER + CTRL + LEFT", "Previous workspace on monitor", hl.dsp.focus({ workspace = "r-1" }))
+o.bind("SUPER + CTRL + RIGHT", "Next workspace on monitor", hl.dsp.focus({ workspace = "r+1" }))'
+}
+
+disable_workspace_nav() {
+    apply_lua_block "Restore Omarchy SUPER+CTRL+LEFT/RIGHT" \
+        "Removes HyDE workspace navigation. SUPER+CTRL+LEFT/RIGHT move focus within a window group again (Omarchy default)." \
+        "$BINDINGS_LUA" "workspace-nav" "Restored SUPER+CTRL+LEFT/RIGHT grouped window focus (Omarchy)"
+}
+
+# Keybind edits are rewritten at the end of bindings.lua. Moving Omarchy's
+# grouped-window focus off SUPER+CTRL+LEFT/RIGHT writes hl.unbind for those keys,
+# which would also drop HyDE workspace navigation, so keep its block after them.
+# A binding the edits put on those keys is reported, not unbound.
+workspace_nav_keep_last() {
+    lua_block_has "$BINDINGS_LUA" "workspace-nav" || return 0
+
+    local conflicts
+    conflicts="$(workspace_nav_conflicts)"
+    if [[ -n "$conflicts" ]]; then
+        echo -e "  ${BOLD}Warning:${RESET} ${DIM}SUPER+CTRL+LEFT/RIGHT is used by HyDE workspace navigation and also bound here:${RESET}"
+        echo "$conflicts" | sed 's/^/    /'
+        echo
+        SUMMARY_LOG+=("✗  HyDE workspace navigation -- SUPER+CTRL+LEFT/RIGHT is also bound elsewhere")
+        return 1
+    fi
+
+    lua_block_write "$BINDINGS_LUA" "workspace-nav" "$(lua_block_get "$BINDINGS_LUA" "workspace-nav")"
+}
+
 # Omarchy's default kb_options (default/hypr/input.lua)
 OMARCHY_KB_OPTIONS="compose:caps,shift:both_capslock_cancel"
 
@@ -5261,7 +5894,11 @@ enable_suspend() {
 
     echo
 
-    rm -f "$SUSPEND_OFF_FLAG"
+    if ! rm -f -- "$SUSPEND_OFF_FLAG" || [[ -e "$SUSPEND_OFF_FLAG" ]]; then
+        echo -e "  ${DIM}✗${RESET}  Could not remove $SUSPEND_OFF_FLAG"
+        SUMMARY_LOG+=("✗  Enable suspend -- failed")
+        return 1
+    fi
 
     echo -e "  ${CHECKED}✓${RESET}  Suspend enabled in system menu"
     SUMMARY_LOG+=("✓  Enabled suspend")
@@ -5301,8 +5938,11 @@ disable_suspend() {
 
     echo
 
-    mkdir -p "$(dirname "$SUSPEND_OFF_FLAG")"
-    touch "$SUSPEND_OFF_FLAG"
+    if ! mkdir -p "$(dirname "$SUSPEND_OFF_FLAG")" || ! touch -- "$SUSPEND_OFF_FLAG"; then
+        echo -e "  ${DIM}✗${RESET}  Could not create $SUSPEND_OFF_FLAG"
+        SUMMARY_LOG+=("✗  Disable suspend -- failed")
+        return 1
+    fi
 
     echo -e "  ${CHECKED}✓${RESET}  Suspend disabled in system menu"
     SUMMARY_LOG+=("✓  Disabled suspend")
@@ -5611,9 +6251,11 @@ disable_fido2() {
 
 # Ids of the tray items currently registered with the StatusNotifier watcher
 tray_item_ids() {
-    local item svc path
-    for item in $(busctl --user get-property org.kde.StatusNotifierWatcher /StatusNotifierWatcher \
-            org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems 2>/dev/null | grep -o '"[^"]*"' | tr -d '"'); do
+    local item svc path registered
+    # Failing to ask the watcher is not the same as an empty tray.
+    registered=$(busctl --user get-property org.kde.StatusNotifierWatcher /StatusNotifierWatcher \
+        org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems 2>/dev/null) || return 1
+    for item in $(grep -o '"[^"]*"' <<< "$registered" | tr -d '"'); do
         svc="${item%%/*}"
         path="/StatusNotifierItem"
         [[ "$item" == */* ]] && path="/${item#*/}"
@@ -5623,7 +6265,7 @@ tray_item_ids() {
 
 _tray_all_pinned() {
     local ids pinned id
-    ids=$(tray_item_ids)
+    ids=$(tray_item_ids) || return 1
     [[ -z "$ids" ]] && return 0
     pinned=$(jq -r '[.bar.layout[]?[]? | select(.id == "omarchy.tray") | .pinned[]?] | .[]' "$SHELL_JSON" 2>/dev/null)
     for id in $ids; do
@@ -5633,8 +6275,9 @@ _tray_all_pinned() {
 }
 
 _tray_pin_all() {
-    local ids_json
-    ids_json=$(tray_item_ids | jq -R . | jq -s .)
+    local ids ids_json
+    ids=$(tray_item_ids) || return 1
+    ids_json=$(jq -Rn '[inputs | select(. != "")]' <<< "$ids") || return 1
     shell_json_jq --argjson ids "$ids_json" '
         .bar.layout |= with_entries(.value |= map(
             if .id == "omarchy.tray" then .pinned = ((.pinned // []) + $ids | unique) | .hidden = ((.hidden // []) - $ids) else . end))
@@ -5741,6 +6384,84 @@ _title_add() { omarchy-bar put omarchy.active-window --after omarchy.workspaces 
 _title_absent() { ! shell_bar_has omarchy.active-window; }
 _title_remove() { shell_bar_remove omarchy.active-window; }
 
+# Supersonic is a separate native bar widget, not a replacement MPRIS service.
+# Helpers must come from this full checkout; never download/execute extra code.
+_supersonic_tool() {
+    [[ -f "$ALC_SUPERSONIC_DIR/stage_plugin.py" ]] && command -v python3 &>/dev/null || {
+        echo "Supersonic music requires python3 and the full checkout (extras/supersonic)." >&2
+        return 1
+    }
+    python3 "$ALC_SUPERSONIC_DIR/stage_plugin.py" \
+        --source "$OMARCHY_DIR/shell/plugins/services/media" --shell "$SHELL_JSON" \
+        "$1" "$HOME/.config/omarchy/plugins/alacarchy.supersonic"
+}
+_supersonic_enabled() { _supersonic_tool --check-enabled; }
+_supersonic_disabled() { _supersonic_tool --check-disabled; }
+_supersonic_enable() { _supersonic_tool --enable; }
+_supersonic_disable() { _supersonic_tool --disable; }
+enable_supersonic_music() {
+    apply_shell_change "Enable Supersonic Music" \
+        "Adds native artist/track/album/year display, playback controls and library search for an already-running Supersonic. Requires this full checkout; no app installation, launch or server credentials." \
+        "Supersonic music enabled" _supersonic_enabled _supersonic_enable
+}
+disable_supersonic_music() {
+    apply_shell_change "Disable Supersonic Music" \
+        "Restores the replaced native media widget (or removes the added entry). Keeps all plugin files and unrelated settings; does not stop Supersonic." \
+        "Supersonic music disabled" _supersonic_disabled _supersonic_disable
+}
+
+# Local llama.cpp router and Grok token tabs share one managed Agents clone;
+# each feature is tracked separately so neither overwrites the other.
+_agents_tool() {
+    local output rc
+    ALC_CHANGE_NOTE=""
+    [[ -f "$ALC_AGENTS_CLONE_DIR/manage.py" ]] && command -v python3 &>/dev/null || {
+        echo "Agents usage tabs require python3 and the full checkout (extras/agents-clone)." >&2
+        ALC_CHANGE_NOTE="python3 and the full checkout are required"
+        return 1
+    }
+    output=$(python3 "$ALC_AGENTS_CLONE_DIR/manage.py" --source "$OMARCHY_DIR/shell/plugins/agents" \
+        --shell "$SHELL_JSON" --plugins "$HOME/.config/omarchy/plugins" "$2" "$1" 2>&1)
+    rc=$?
+    [[ -z "$output" ]] || printf '%s\n' "$output"
+    # The helper prints one safe, human-readable "Refused:" line (no config text).
+    ALC_CHANGE_NOTE=$(sed -n 's/^  Refused: //p' <<< "$output" | head -n 1)
+    return "$rc"
+}
+_local_stats_enabled() { _agents_tool local --check-enabled; }
+_local_stats_disabled() { _agents_tool local --check-disabled; }
+_local_stats_enable() { _agents_tool local --enable; }
+_local_stats_disable() { _agents_tool local --disable; }
+_grok_usage_enabled() { _agents_tool grok --check-enabled; }
+_grok_usage_disabled() { _agents_tool grok --check-disabled; }
+_grok_usage_enable() { _agents_tool grok --enable; }
+_grok_usage_disable() { _agents_tool grok --disable; }
+enable_local_router_stats() {
+    apply_shell_change "Enable Local LLM Stats" \
+        "Adds a Local section to the Agents panel for sampled llama.cpp router tokens. Installs the collector and an inactive user service only: it does not start collection, enable router metrics, reload the router or load models. Requires this full checkout." \
+        "Local LLM stats staged (collection pending activation)" _local_stats_enabled _local_stats_enable || return 1
+    # The helper's activation instructions scroll away with the next action.
+    if (( ${#SUMMARY_LOG[@]} )) && [[ "${SUMMARY_LOG[-1]}" == ✓* ]]; then
+        SUMMARY_LOG+=("   Start collecting later (llama.cpp must run with --metrics): systemctl --user daemon-reload && systemctl --user enable --now local-router-stats.service")
+    fi
+    return 0
+}
+disable_local_router_stats() {
+    apply_shell_change "Disable Local LLM Stats" \
+        "Removes the Local section. Stops/disables only the A La Carchy collector service (never the router) and removes its unit; keeps history and the Grok tab if enabled." \
+        "Local LLM stats disabled" _local_stats_disabled _local_stats_disable
+}
+enable_grok_usage() {
+    apply_shell_change "Enable Grok Tokens" \
+        "Adds a Grok tab to the Agents panel from Grok's documented status-line token counters. Refused where Omarchy already shows Grok usage itself. Adds a [ui.status_line] row to ~/.grok/config.toml only if none exists; new Grok sessions pick it up. No credentials, network or quota guesses. Requires this full checkout." \
+        "Grok tokens enabled (quota unknown)" _grok_usage_enabled _grok_usage_enable
+}
+disable_grok_usage() {
+    apply_shell_change "Disable Grok Tokens" \
+        "Removes the Grok tab and the A La Carchy status-line row (only if unmodified). Keeps history and the Local tab if enabled." \
+        "Grok tokens disabled" _grok_usage_disabled _grok_usage_disable
+}
+
 show_window_title() {
     apply_shell_change "Show Window Title" \
         "Shows the focused window's title on the bar next to the workspaces." \
@@ -5753,14 +6474,140 @@ hide_window_title() {
         "Window title hidden from bar" _title_absent _title_remove
 }
 
-# Clock format as stored in shell.json (Qt date format), with the widget default
+# Resolve the built-in clock or a supported user clone, so all clock controls
+# keep working after seconds support switches the bar to a local plugin.
+clock_widget_id() {
+    local id manifest
+    while IFS= read -r id; do
+        if [[ "$id" == omarchy.clock ]]; then printf '%s\n' "$id"; return; fi
+        [[ "$id" =~ ^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$ ]] || continue
+        manifest="$HOME/.config/omarchy/plugins/$id/manifest.json"
+        if [[ -f "$manifest" ]] && jq -e '.omarchy.clonedFrom == "omarchy.clock"' "$manifest" >/dev/null 2>&1; then
+            printf '%s\n' "$id"; return
+        fi
+    done < <(jq -r '.bar.layout[]?[]? | .id // empty' "$SHELL_JSON" 2>/dev/null)
+    printf '%s\n' omarchy.clock
+}
+
+# Clock format uses Qt tokens (minutes are mm, seconds are ss).
 clock_format() {
     local f
-    f=$(shell_bar_get omarchy.clock format)
+    f=$(shell_bar_get "$(clock_widget_id)" format)
     echo "${f:-dddd HH:mm}"
 }
 
-_clock_set_format() { omarchy-bar set omarchy.clock format "$1" &>/dev/null; }
+_clock_set_format() { omarchy-bar set "$(clock_widget_id)" format "$1" &>/dev/null; }
+
+# Preserve Qt quoted literals and the day/date portion of a custom format.
+_clock_transform() {
+    python3 - "$1" "$(clock_format)" <<'PY'
+import re, sys
+mode, fmt = sys.argv[1:]
+parts = re.findall(r"'(?:[^']|'')*'|[^']+", fmt)
+if ''.join(parts) != fmt:
+    raise SystemExit(1)
+plain = [p for p in parts if not p.startswith("'")]
+time = r'(?:HH|hh|H|h):mm(?::ss)?'
+if mode == 'seconds-check':
+    raise SystemExit(0 if any(re.search(r'(?:HH|hh|H|h):mm:ss', p) for p in plain) else 1)
+if mode == '12h-check':
+    raise SystemExit(0 if any(re.search(r'AP|ap', p) for p in plain) else 1)
+patterns = {
+    'seconds-show': (r'((?:HH|hh|H|h):mm)(?!:ss)', lambda m: m[1] + ':ss'),
+    'seconds-hide': (r'((?:HH|hh|H|h):mm):ss', lambda m: m[1]),
+    '12h': (r'HH(:mm(?::ss)?)', lambda m: 'h' + m[1] + ' AP'),
+    '24h': (r'(?:hh|h)(:mm(?::ss)?) (?:AP|ap)', lambda m: 'HH' + m[1]),
+}
+if mode not in patterns or not any(re.search(time, p) for p in plain):
+    raise SystemExit(1)
+pattern, replace = patterns[mode]
+print(''.join(p if p.startswith("'") else re.sub(pattern, replace, p) for p in parts))
+PY
+}
+
+_clock_precision_expression() {
+    printf '%s\n' "root.configuredFormat.replace(/'(?:[^']|'')*'/g, \"\").indexOf(\":ss\") >= 0 ? SystemClock.Seconds : SystemClock.Minutes"
+}
+
+_clock_seconds_precision_ready() {
+    local id file expected line count=0 matched=0
+    id=$(clock_widget_id)
+    [[ "$id" != omarchy.clock ]] || return 1
+    file="$HOME/.config/omarchy/plugins/$id/BarWidget.qml"
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    expected="precision: $(_clock_precision_expression)"
+    while IFS=$' \t' read -r line; do
+        line="${line%$'\r'}"
+        [[ "$line" == precision:* ]] || continue
+        count=$((count + 1))
+        [[ "$line" == "$expected" || "$line" == 'precision: SystemClock.Seconds' ]] && matched=1
+    done < "$file"
+    [[ "$count" == 1 && "$matched" == 1 ]]
+}
+
+_clock_prepare_seconds_precision() {
+    local id dir file clone_id
+    id=$(clock_widget_id)
+    if [[ "$id" == omarchy.clock ]]; then
+        clone_id="${USER:-$(id -un)}.clock"
+        [[ "$clone_id" =~ ^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$ ]] || return 1
+        dir="$HOME/.config/omarchy/plugins/$clone_id"
+        if [[ -e "$dir" || -L "$dir" ]]; then
+            [[ -d "$dir" && ! -L "$dir" ]] &&
+                jq -e '.omarchy.clonedFrom == "omarchy.clock"' "$dir/manifest.json" >/dev/null 2>&1 || return 1
+            omarchy-plugin-enable "$clone_id" >/dev/null 2>&1 || return 1
+        else
+            # Stock SystemClock.Minutes does not tick each second. Use the
+            # supported clone API; never edit the package-owned plugin.
+            omarchy-plugin-clone omarchy.clock >/dev/null 2>&1 || return 1
+        fi
+        id=$(clock_widget_id)
+        [[ "$id" != omarchy.clock ]] || return 1
+    fi
+    dir="$HOME/.config/omarchy/plugins/$id"
+    file="$dir/BarWidget.qml"
+    [[ -d "$dir" && ! -L "$dir" && -f "$file" && ! -L "$file" ]] || return 1
+    _clock_seconds_precision_ready && return 0
+    # Refuse unfamiliar user customizations rather than overwriting a plugin.
+    [[ "$(grep -Ec '^[[:space:]]*precision:' "$file")" == 1 ]] &&
+        [[ "$(grep -Ec '^[[:space:]]*precision: SystemClock.Minutes[[:space:]]*$' "$file")" == 1 ]] &&
+        grep -q 'property string configuredFormat:' "$file" || return 1
+    backup_file "$file" || return 1
+    python3 - "$file" "$(_clock_precision_expression)" <<'PY'
+import pathlib, re, sys
+p = pathlib.Path(sys.argv[1])
+with p.open(newline='') as f:
+    s = f.read()
+s, count = re.subn(r'(?m)^([ \t]*)precision: SystemClock.Minutes[ \t]*(\r?)$',
+    lambda m: m[1] + 'precision: ' + sys.argv[2] + m[2], s)
+if count != 1:
+    raise SystemExit(1)
+with p.open('w', newline='') as f:
+    f.write(s)
+PY
+}
+
+_clock_seconds_shown() { _clock_transform seconds-check && _clock_seconds_precision_ready; }
+_clock_seconds_hidden() { ! _clock_transform seconds-check; }
+_clock_seconds_show() {
+    local f
+    f=$(_clock_transform seconds-show) || return 1
+    _clock_prepare_seconds_precision || return 1
+    _clock_set_format "$f"
+}
+_clock_seconds_hide() { local f; f=$(_clock_transform seconds-hide) || return 1; _clock_set_format "$f"; }
+
+show_clock_seconds() {
+    apply_shell_change "Show Clock Seconds" \
+        "Shows seconds on the top bar (HH:mm:ss). Uses a local clock clone for second-by-second updates; keeps the day and 12/24-hour preferences." \
+        "Clock seconds shown" _clock_seconds_shown _clock_seconds_show
+}
+
+hide_clock_seconds() {
+    apply_shell_change "Hide Clock Seconds" \
+        "Hides seconds on the bar clock; keeps the day and 12/24-hour preferences." \
+        "Clock seconds hidden" _clock_seconds_hidden _clock_seconds_hide
+}
 
 _date_shown() { [[ "$(clock_format)" == *dddd* ]]; }
 _date_show() { _clock_set_format "dddd $(clock_format)"; }
@@ -5779,10 +6626,10 @@ hide_clock_date() {
         "Clock day name hidden" _date_hidden _date_hide
 }
 
-_clock_is_12h() { [[ "$(clock_format)" == *AP* || "$(clock_format)" == *ap* ]]; }
-_clock_to_12h() { local f; f="$(clock_format)"; _clock_set_format "${f/HH:mm/h:mm AP}"; }
+_clock_is_12h() { _clock_transform 12h-check; }
+_clock_to_12h() { local f; f=$(_clock_transform 12h) || return 1; _clock_set_format "$f"; }
 _clock_is_24h() { ! _clock_is_12h; }
-_clock_to_24h() { local f; f="$(clock_format)"; f="${f/h:mm AP/HH:mm}"; _clock_set_format "${f/h:mm ap/HH:mm}"; }
+_clock_to_24h() { local f; f=$(_clock_transform 24h) || return 1; _clock_set_format "$f"; }
 
 enable_12h_clock() {
     apply_shell_change "12-Hour Clock" \
@@ -5800,12 +6647,7 @@ MEDIA_DIRS_MARKER_START="# >>> a-la-carchy media-dirs"
 MEDIA_DIRS_MARKER_END="# <<< a-la-carchy media-dirs"
 
 _media_dirs_remove() {
-    [[ -f "$UWSM_DEFAULT" ]] || return 0
-    awk -v s="$MEDIA_DIRS_MARKER_START" -v e="$MEDIA_DIRS_MARKER_END" '
-        $0 == s { skip = 1; next }
-        $0 == e { skip = 0; next }
-        !skip { print }
-    ' "$UWSM_DEFAULT" > "${UWSM_DEFAULT}.tmp" && mv "${UWSM_DEFAULT}.tmp" "$UWSM_DEFAULT"
+    marked_block_remove "$UWSM_DEFAULT" "$MEDIA_DIRS_MARKER_START" "$MEDIA_DIRS_MARKER_END" keep-blank
 }
 
 enable_media_directories() {
@@ -5828,14 +6670,23 @@ enable_media_directories() {
 
     confirm_continue "Enable media directories" || return 0
 
-    mkdir -p "$HOME/Pictures/Screenshots" "$HOME/Videos/Screencasts" "$(dirname "$UWSM_DEFAULT")"
-    [[ -f "$UWSM_DEFAULT" ]] && backup_file "$UWSM_DEFAULT"
-    {
-        echo "$MEDIA_DIRS_MARKER_START"
-        echo 'export OMARCHY_SCREENSHOT_DIR="$HOME/Pictures/Screenshots"'
-        echo 'export OMARCHY_SCREENRECORD_DIR="$HOME/Videos/Screencasts"'
-        echo "$MEDIA_DIRS_MARKER_END"
-    } >> "$UWSM_DEFAULT"
+    if ! mkdir -p "$HOME/Pictures/Screenshots" "$HOME/Videos/Screencasts" "$(dirname "$UWSM_DEFAULT")"; then
+        echo -e "  ${DIM}✗${RESET}  Could not create the media directories"
+        SUMMARY_LOG+=("✗  Enable media directories -- failed (could not create directories)")
+        return 1
+    fi
+    if [[ -f "$UWSM_DEFAULT" ]] && ! backup_file "$UWSM_DEFAULT"; then
+        SUMMARY_LOG+=("✗  Enable media directories -- failed (backup failed)")
+        return 1
+    fi
+    if ! printf '%s\n' "$MEDIA_DIRS_MARKER_START" \
+        'export OMARCHY_SCREENSHOT_DIR="$HOME/Pictures/Screenshots"' \
+        'export OMARCHY_SCREENRECORD_DIR="$HOME/Videos/Screencasts"' \
+        "$MEDIA_DIRS_MARKER_END" >> "$UWSM_DEFAULT"; then
+        echo -e "  ${DIM}✗${RESET}  Could not write $UWSM_DEFAULT"
+        SUMMARY_LOG+=("✗  Enable media directories -- failed (config write failed)")
+        return 1
+    fi
 
     echo -e "  ${CHECKED}✓${RESET}  Media directories enabled (log out and back in to apply)"
     SUMMARY_LOG+=("✓  Enabled screenshot/recording directories")
@@ -5861,8 +6712,15 @@ disable_media_directories() {
 
     confirm_continue "Disable media directories" || return 0
 
-    backup_file "$UWSM_DEFAULT"
-    _media_dirs_remove
+    if ! backup_file "$UWSM_DEFAULT"; then
+        SUMMARY_LOG+=("✗  Disable media directories -- failed (backup failed)")
+        return 1
+    fi
+    if ! _media_dirs_remove; then
+        echo -e "  ${DIM}✗${RESET}  The media-dirs block in $UWSM_DEFAULT is damaged; left unchanged"
+        SUMMARY_LOG+=("✗  Disable media directories -- failed (managed block is damaged; nothing changed)")
+        return 1
+    fi
     # The override file is optional; drop it if only our block was in it
     [[ -s "$UWSM_DEFAULT" ]] || rm -f "$UWSM_DEFAULT"
 
@@ -5877,7 +6735,8 @@ alc_launch_command() {
     local self
     self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)"
     if [[ -f "$self" && "$self" != /dev/* && "$self" != /proc/* ]]; then
-        echo "omarchy-launch-tui --app-id=org.omarchy.a-la-carchy $self"
+        # The menu hands this string to a shell: quote the checkout path.
+        printf 'omarchy-launch-tui --app-id=org.omarchy.a-la-carchy %q\n' "$self"
     else
         echo "omarchy-launch-tui --app-id=org.omarchy.a-la-carchy bash -c 'bash <(curl -fsSL $ALC_SCRIPT_URL)'"
     fi
@@ -5885,22 +6744,27 @@ alc_launch_command() {
 
 
 _menu_entry_remove() {
-    [[ -f "$MENU_JSONC" ]] || return 0
-    awk -v s="$MENU_MARKER_START" -v e="$MENU_MARKER_END" '
-        $0 == s { skip = 1; next }
-        $0 == e { skip = 0; next }
-        !skip { print }
-    ' "$MENU_JSONC" > "${MENU_JSONC}.tmp" && mv "${MENU_JSONC}.tmp" "$MENU_JSONC"
+    marked_block_remove "$MENU_JSONC" "$MENU_MARKER_START" "$MENU_MARKER_END" keep-blank
 }
 
 add_to_omarchy_menu() {
     echo
     echo -e "  ${BOLD}Adding A La Carchy to Omarchy menu...${RESET}"
 
-    mkdir -p "$(dirname "$MENU_JSONC")"
-    [[ -f "$MENU_JSONC" ]] || printf '{\n}\n' > "$MENU_JSONC"
-    backup_file "$MENU_JSONC"
-    _menu_entry_remove
+    if ! mkdir -p "$(dirname "$MENU_JSONC")" || { [[ ! -f "$MENU_JSONC" ]] && ! printf '{\n}\n' > "$MENU_JSONC"; }; then
+        echo -e "  ${DIM}✗${RESET}  Could not create $MENU_JSONC"
+        SUMMARY_LOG+=("✗  Add menu shortcut -- could not create $MENU_JSONC")
+        return 1
+    fi
+    if ! backup_file "$MENU_JSONC"; then
+        SUMMARY_LOG+=("✗  Add menu shortcut -- failed (backup failed)")
+        return 1
+    fi
+    if ! _menu_entry_remove; then
+        echo -e "  ${DIM}✗${RESET}  The existing A La Carchy menu block is damaged; $MENU_JSONC was left unchanged"
+        SUMMARY_LOG+=("✗  Add menu shortcut -- existing menu block is damaged; nothing changed")
+        return 1
+    fi
 
     # Root-level entry, inserted right after the opening brace so it is always
     # followed by valid JSONC (the menu parser drops trailing commas)
@@ -5909,12 +6773,7 @@ add_to_omarchy_menu() {
     entry=$(jq -cn --arg action "$action" \
         '{icon: "󰒓", label: "A La Carchy", aliases: ["carchy"], description: "Omarchy debloater and optimizer", action: $action}')
 
-    ALC_LINE="  \"alacarchy\": $entry," awk -v s="$MENU_MARKER_START" -v e="$MENU_MARKER_END" '
-        !done && /^[[:space:]]*\{[[:space:]]*$/ { print; print s; print ENVIRON["ALC_LINE"]; print e; done = 1; next }
-        { print }
-    ' "$MENU_JSONC" > "${MENU_JSONC}.tmp" && mv "${MENU_JSONC}.tmp" "$MENU_JSONC"
-
-    if grep -qxF -- "$MENU_MARKER_START" "$MENU_JSONC"; then
+    if [[ -n "$entry" ]] && menu_block_insert "$MENU_MARKER_START" "$MENU_MARKER_END" "  \"alacarchy\": $entry,"; then
         omarchy-menu refresh &>/dev/null || true
         echo -e "  ${CHECKED}✓${RESET}  A La Carchy added to the Omarchy menu"
         SUMMARY_LOG+=("✓  Add menu shortcut -- added A La Carchy to Omarchy menu")
@@ -5936,8 +6795,15 @@ remove_from_omarchy_menu() {
         return 0
     fi
 
-    backup_file "$MENU_JSONC"
-    _menu_entry_remove
+    if ! backup_file "$MENU_JSONC"; then
+        SUMMARY_LOG+=("✗  Remove menu shortcut -- failed (backup failed)")
+        return 1
+    fi
+    if ! _menu_entry_remove; then
+        echo -e "  ${DIM}✗${RESET}  The A La Carchy menu block is damaged; $MENU_JSONC was left unchanged"
+        SUMMARY_LOG+=("✗  Remove menu shortcut -- menu block is damaged; nothing changed")
+        return 1
+    fi
     omarchy-menu refresh &>/dev/null || true
 
     echo -e "  ${CHECKED}✓${RESET}  A La Carchy removed from the Omarchy menu"
@@ -6270,6 +7136,24 @@ remove_themarchy_keybind() {
 }
 
 # =============================================================================
+# Bounded security menus load function-only helpers from the full checkout.
+ALC_EXTRAS_DIR="${ALC_SUPERSONIC_DIR%/supersonic}"
+open_bounded_dialog() {
+    local group="$1" id="$2" helper="$ALC_EXTRAS_DIR/privacy/menu.sh"
+    if [[ ! -f "$helper" ]]; then
+        echo 'Unavailable: Privacy, OS Hardening and Custom Kernel require the full checkout.' >&2
+        SUMMARY_LOG+=("✗  $group — full checkout unavailable")
+        return 1
+    fi
+    source "$helper" || return 1
+    case "$group" in
+        PRIVACY) show_privacy_dialog "$id" ;;
+        HARDENING) show_hardening_dialog "$id" ;;
+        CUSTOM_KERNEL) show_kernel_dialog "$id" ;;
+        *) return 1 ;;
+    esac
+}
+
 # TWO-PANEL TUI DATA STRUCTURES
 # =============================================================================
 
@@ -6298,6 +7182,9 @@ declare -a CATEGORIES=(
     "  Extra Themes"
     "--- Themarchy ---"
     "  Themarchy"
+    "  Privacy & OPSEC"
+    "  OS Hardening"
+    "  Custom Kernel"
 )
 
 # Check if a category index is a section header
@@ -6329,6 +7216,7 @@ declare -a KEYBINDINGS_ITEMS=(
     "shutdown|Shutdown|Bind|Unbind|toggle|Bind SUPER+ALT+S to shutdown the system"
     "restart|Restart|Bind|Unbind|toggle|Bind SUPER+ALT+R to restart the system"
     "theme_menu|Theme menu|Bind|Unbind|toggle|Bind ALT+T to open the theme selector"
+    "workspace_nav|Workspace nav|HyDE|Omarchy|radio|SUPER+CTRL+LEFT/RIGHT: previous/next workspace (HyDE) or group focus"
 )
 
 declare -a DISPLAY_ITEMS=(
@@ -6340,6 +7228,7 @@ declare -a DISPLAY_ITEMS=(
 )
 
 declare -a SYSTEM_ITEMS=(
+    "voice_dictation|Dictation|Remove|Keep|radio|Remove supported dictation apps; keep models, recordings and shared libraries"
     "suspend|Suspend|Enable|Disable|toggle|Allow system to suspend/sleep when idle"
     "hibernation|Hibernation|Enable|Disable|toggle|Allow system to hibernate to disk"
     "fingerprint|Fingerprint|Enable|Disable|toggle|Enable fingerprint authentication for login"
@@ -6358,6 +7247,10 @@ declare -a APPEARANCE_ITEMS=(
     "update_icon|Update icon|Remove|Restore|toggle|Remove or restore the system update icon on the bar"
     "clock_format|Clock format|12h|24h|radio|Set the bar clock to 12-hour or 24-hour format"
     "clock_date|Clock date|Show|Hide|toggle|Show or hide the day name on the bar clock"
+    "clock_seconds|Clock seconds|Show|Hide|toggle|Show HH:mm:ss (or h:mm:ss AM/PM) with second-by-second clock updates"
+    "supersonic|Supersonic music|Enable|Disable|toggle|Native Supersonic metadata, playback and song/album library search (full checkout required)"
+    "local_stats|Local LLM stats|Enable|Disable|toggle|Agents panel Local section: sampled llama.cpp router tokens; collection stays off until you activate it (full checkout)"
+    "grok_usage|Grok tokens|Enable|Disable|toggle|Agents panel Grok tab from status-line counters; only where Omarchy has no Grok usage of its own (full checkout)"
     "window_title|Window title|Show|Hide|toggle|Show active window title on the bar next to workspaces"
     "media_dirs|Media dirs|Enable|Disable|toggle|Organize screenshots and recordings into subdirs"
 )
@@ -6365,6 +7258,29 @@ declare -a APPEARANCE_ITEMS=(
 declare -a KEYBOARD_ITEMS=(
     "caps_lock|Caps Lock|Normal|Compose|radio|Use Caps Lock normally or as Compose key"
     "alt_super|Alt/Super|Swap|Normal|radio|Swap Alt and Super keys (useful for Mac keyboards)"
+)
+
+declare -a PRIVACY_ITEMS=(
+    "privacy_recent|Recent file recording|[Open]||action|Opt-in GNOME + GTK recent recording; Restore preserves originals; no purge"
+    "privacy_indexing|Dedicated file indexing|[Open]||action|Only stock LocalSearch indexer + indexing proxy user units; search tradeoff"
+    "privacy_thumbnails|Nautilus thumbnails|[Open]||action|Stop Nautilus previews without deleting existing cache; restore prior setting"
+    "privacy_purge_recent|Purge recent list|[Open]||action|One-shot recently-used.xbel purge; irreversible, no backup, not secure erasure"
+    "privacy_purge_thumbnails|Purge thumbnail cache|[Open]||action|One-shot thumbnail cache purge; no symlink following, not secure erasure"
+)
+
+declare -a HARDENING_ITEMS=(
+    "hardening_audit|Security status audit|[Open]||action|Read-only bounded sysctl audit; not a security certification"
+    "hardening_kptr|Kernel pointer exposure|[Open]||action|Opt-in kptr_restrict=2; exact persistence/readback; profiling costs"
+    "hardening_dmesg|Kernel log access|[Open]||action|Opt-in dmesg_restrict=1; CAP_SYSLOG required, no audit weakening"
+    "hardening_ptrace|Restricted ptrace|[Open]||action|Opt-in Yama ptrace_scope=1; debugger costs; never lower stronger values"
+    "hardening_bpf|Unprivileged BPF|[Open]||action|Opt-in reversible BPF restriction=2; never write irreversible value 1"
+)
+
+declare -a CUSTOM_KERNEL_ITEMS=(
+    "kernel_path|Choose checkout path|[Open]||action|Explicit session-only path; never silently repair /home/git/linux-tkg"
+    "kernel_inspect|Inspect kernel checkout|[Open]||action|Read-only git/kernel/config hints; no source/eval; effective config may be unknown"
+    "kernel_packages|Local package metadata|[Open]||action|Read-only top-level archives; metadata only, no extract/install or boot claims"
+    "kernel_preview|Build command preview|[Open]||action|Source-backed build-only preview; NOT EXECUTED; no install or boot changes"
 )
 
 declare -a UTILITIES_ITEMS=(
@@ -6890,6 +7806,9 @@ get_category_items() {
         18) echo "ROG_LIGHTING" ;;
         20) echo "EXTRA_THEMES" ;;
         22) echo "THEMARCHY" ;;
+        23) echo "PRIVACY" ;;
+        24) echo "HARDENING" ;;
+        25) echo "CUSTOM_KERNEL" ;;
     esac
 }
 
@@ -6915,6 +7834,9 @@ get_current_item_count() {
         18) echo ${#ROG_LIGHTING_ITEMS[@]} ;;
         20) echo ${#EXTRA_THEMES[@]} ;;
         22) echo ${#THEMARCHY_ITEMS[@]} ;;
+        23) echo ${#PRIVACY_ITEMS[@]} ;;
+        24) echo ${#HARDENING_ITEMS[@]} ;;
+        25) echo ${#CUSTOM_KERNEL_ITEMS[@]} ;;
     esac
 }
 
@@ -7008,6 +7930,12 @@ get_current_description() {
             ;;
         22) # Themarchy
             parse_toggle_item "${THEMARCHY_ITEMS[$ITEM_CURSOR]}"
+            echo "$TOGGLE_DESC"
+            ;;
+        23|24|25)
+            local bounded_arr="$(get_category_items "$CATEGORY_CURSOR")_ITEMS"
+            local -n bounded_ref="$bounded_arr"
+            parse_toggle_item "${bounded_ref[$ITEM_CURSOR]}"
             echo "$TOGGLE_DESC"
             ;;
         *)
@@ -7364,6 +8292,11 @@ draw_interface() {
                     else
                         R="  ○ ${tname}${installed_suffix}"
                     fi ;;
+                23|24|25)
+                    local bounded_arr="$(get_category_items "$CATEGORY_CURSOR")_ITEMS"
+                    local -n bounded_ref="$bounded_arr"
+                    parse_toggle_item "${bounded_ref[$idx]}"
+                    R="  $TOGGLE_NAME  [Open]" ;;
                 22) parse_toggle_item "${THEMARCHY_ITEMS[$idx]}"
                     if [ "$TOGGLE_TYPE" = "action" ]; then
                         local th_suffix=""
@@ -7458,6 +8391,8 @@ draw_interface() {
     local footer_text=""
     if [ $CATEGORY_CURSOR -eq 20 ]; then
         footer_text="←→ Navigate   ↑↓ Move   Space Select   A All   Enter Confirm   Q Quit"
+    elif [[ "$CATEGORY_CURSOR" == 23 || "$CATEGORY_CURSOR" == 24 || "$CATEGORY_CURSOR" == 25 ]]; then
+        footer_text="←→ Navigate   ↑↓ Move   Space Open (own confirmation)   Q Quit"
     elif [ $CATEGORY_CURSOR -eq 5 ] || [ $CATEGORY_CURSOR -eq 6 ] || [ $CATEGORY_CURSOR -eq 7 ] || [ $CATEGORY_CURSOR -eq 12 ] || [ $CATEGORY_CURSOR -eq 13 ] || [ $CATEGORY_CURSOR -eq 14 ] || [ $CATEGORY_CURSOR -eq 15 ] || [ $CATEGORY_CURSOR -eq 17 ] || [ $CATEGORY_CURSOR -eq 18 ]; then
         footer_text="←→ Navigate   ↑↓ Move   Space Edit   R Reset   Enter Confirm   Q Quit"
     else
@@ -7878,6 +8813,19 @@ toggle_current_item() {
                 fi
             fi
             ;;
+        23|24|25) # Apply only after the dedicated dialog's own confirmation.
+            local bounded_group="$(get_category_items "$CATEGORY_CURSOR")"
+            local bounded_arr="${bounded_group}_ITEMS"
+            local -n bounded_ref="$bounded_arr"
+            parse_toggle_item "${bounded_ref[$ITEM_CURSOR]}"
+            local bounded_rc=0
+            stty echo 2>/dev/null
+            tput cnorm
+            open_bounded_dialog "$bounded_group" "$TOGGLE_ID" || bounded_rc=$?
+            tput civis
+            stty -echo 2>/dev/null
+            return "$bounded_rc"
+            ;;
     esac
 }
 
@@ -7977,6 +8925,14 @@ UNBIND_THEME_MENU=false
 case "${TOGGLE_SELECTIONS[theme_menu]:-0}" in
     1) BIND_THEME_MENU=true ;;
     2) UNBIND_THEME_MENU=true ;;
+esac
+
+# workspace_nav: 1=HyDE (workspace arrows), 2=Omarchy (grouped window focus)
+ENABLE_WORKSPACE_NAV=false
+DISABLE_WORKSPACE_NAV=false
+case "${TOGGLE_SELECTIONS[workspace_nav]:-0}" in
+    1) ENABLE_WORKSPACE_NAV=true ;;
+    2) DISABLE_WORKSPACE_NAV=true ;;
 esac
 
 # monitor_scale: 1=4K, 2=1080p/1440p
@@ -8099,6 +9055,38 @@ case "${TOGGLE_SELECTIONS[clock_date]:-0}" in
     2) HIDE_CLOCK_DATE=true ;;
 esac
 
+# clock_seconds: 1=Show, 2=Hide
+SHOW_CLOCK_SECONDS=false
+HIDE_CLOCK_SECONDS=false
+case "${TOGGLE_SELECTIONS[clock_seconds]:-0}" in
+    1) SHOW_CLOCK_SECONDS=true ;;
+    2) HIDE_CLOCK_SECONDS=true ;;
+esac
+
+# supersonic: 1=Enable, 2=Disable
+ENABLE_SUPERSONIC=false
+DISABLE_SUPERSONIC=false
+case "${TOGGLE_SELECTIONS[supersonic]:-0}" in
+    1) ENABLE_SUPERSONIC=true ;;
+    2) DISABLE_SUPERSONIC=true ;;
+esac
+
+# local_stats: 1=Enable, 2=Disable
+ENABLE_LOCAL_STATS=false
+DISABLE_LOCAL_STATS=false
+case "${TOGGLE_SELECTIONS[local_stats]:-0}" in
+    1) ENABLE_LOCAL_STATS=true ;;
+    2) DISABLE_LOCAL_STATS=true ;;
+esac
+
+# grok_usage: 1=Enable, 2=Disable
+ENABLE_GROK_USAGE=false
+DISABLE_GROK_USAGE=false
+case "${TOGGLE_SELECTIONS[grok_usage]:-0}" in
+    1) ENABLE_GROK_USAGE=true ;;
+    2) DISABLE_GROK_USAGE=true ;;
+esac
+
 # window_title: 1=Show, 2=Hide
 SHOW_WINDOW_TITLE=false
 HIDE_WINDOW_TITLE=false
@@ -8128,6 +9116,10 @@ BACKUP_CONFIGS=false
 if [ "${TOGGLE_SELECTIONS[backup_config]:-0}" -eq 1 ]; then
     BACKUP_CONFIGS=true
 fi
+
+# voice_dictation: 1=Remove, 2=Keep (no action)
+REMOVE_VOICE_DICTATION=false
+[[ "${TOGGLE_SELECTIONS[voice_dictation]:-0}" == 1 ]] && REMOVE_VOICE_DICTATION=true
 
 # menu_shortcut: 1=Add, 2=Remove
 ADD_MENU_SHORTCUT=false
@@ -8332,6 +9324,8 @@ declare -a ACTION_SUMMARY=()
 [ "$UNBIND_RESTART" = true ] && ACTION_SUMMARY+=("Unbind restart")
 [ "$BIND_THEME_MENU" = true ] && ACTION_SUMMARY+=("Bind theme menu to ALT+T")
 [ "$UNBIND_THEME_MENU" = true ] && ACTION_SUMMARY+=("Unbind theme menu")
+[ "$ENABLE_WORKSPACE_NAV" = true ] && ACTION_SUMMARY+=("Bind SUPER+CTRL+LEFT/RIGHT to previous/next workspace (HyDE)")
+[ "$DISABLE_WORKSPACE_NAV" = true ] && ACTION_SUMMARY+=("Restore SUPER+CTRL+LEFT/RIGHT grouped window focus (Omarchy)")
 [ ${#BINDING_EDITS[@]} -gt 0 ] && ACTION_SUMMARY+=("Apply ${#BINDING_EDITS[@]} keybinding edit(s)")
 [ ${#HYPR_EDITS[@]} -gt 0 ] && ACTION_SUMMARY+=("Apply ${#HYPR_EDITS[@]} Hyprland setting(s)")
 [ "$RESTORE_CAPSLOCK" = true ] && ACTION_SUMMARY+=("Restore Caps Lock")
@@ -8397,6 +9391,7 @@ fi
 [ "$DISABLE_FINGERPRINT" = true ] && ACTION_SUMMARY+=("Disable fingerprint auth")
 [ "$ENABLE_FIDO2" = true ] && ACTION_SUMMARY+=("Enable FIDO2 auth")
 [ "$DISABLE_FIDO2" = true ] && ACTION_SUMMARY+=("Disable FIDO2 auth")
+[ "$REMOVE_VOICE_DICTATION" = true ] && ACTION_SUMMARY+=("Remove supported voice dictation apps (keep user data and shared libraries)")
 [ "$SHOW_ALL_TRAY_ICONS" = true ] && ACTION_SUMMARY+=("Show all tray icons")
 [ "$HIDE_TRAY_ICONS" = true ] && ACTION_SUMMARY+=("Hide tray icons")
 [ "$REMOVE_OMARCHY_LOGO" = true ] && ACTION_SUMMARY+=("Remove Omarchy logo from bar")
@@ -8413,6 +9408,14 @@ fi
 [ "$DISABLE_12H_CLOCK" = true ] && ACTION_SUMMARY+=("Disable 12-hour clock")
 [ "$SHOW_CLOCK_DATE" = true ] && ACTION_SUMMARY+=("Show clock date")
 [ "$HIDE_CLOCK_DATE" = true ] && ACTION_SUMMARY+=("Hide clock date")
+[ "$SHOW_CLOCK_SECONDS" = true ] && ACTION_SUMMARY+=("Show clock seconds")
+[ "$HIDE_CLOCK_SECONDS" = true ] && ACTION_SUMMARY+=("Hide clock seconds")
+[ "$ENABLE_SUPERSONIC" = true ] && ACTION_SUMMARY+=("Enable Supersonic music")
+[ "$DISABLE_SUPERSONIC" = true ] && ACTION_SUMMARY+=("Disable Supersonic music")
+[ "$ENABLE_LOCAL_STATS" = true ] && ACTION_SUMMARY+=("Enable Local LLM stats (collection stays off)")
+[ "$DISABLE_LOCAL_STATS" = true ] && ACTION_SUMMARY+=("Disable Local LLM stats")
+[ "$ENABLE_GROK_USAGE" = true ] && ACTION_SUMMARY+=("Enable Grok tokens")
+[ "$DISABLE_GROK_USAGE" = true ] && ACTION_SUMMARY+=("Disable Grok tokens")
 [ "$SHOW_WINDOW_TITLE" = true ] && ACTION_SUMMARY+=("Show window title")
 [ "$HIDE_WINDOW_TITLE" = true ] && ACTION_SUMMARY+=("Hide window title")
 [ "$ENABLE_MEDIA_DIRECTORIES" = true ] && ACTION_SUMMARY+=("Enable media directories")
@@ -8461,6 +9464,11 @@ fi
 # Handle keybind restore (runs its own confirmation flow)
 if [ "$RESTORE_KEYBINDS" = true ]; then
     restore_close_window
+fi
+
+# Dictation removal is opt-in and previews exact installed targets.
+if [ "$REMOVE_VOICE_DICTATION" = true ]; then
+    remove_voice_dictation
 fi
 
 # Handle monitor scaling (runs its own confirmation flow)
@@ -8559,6 +9567,15 @@ fi
 
 # Apply keybind editor changes
 apply_binding_edits
+
+# After the keybind edits, so the workspace-nav block ends up below theirs
+if [ "$ENABLE_WORKSPACE_NAV" = true ]; then
+    enable_workspace_nav
+fi
+
+if [ "$DISABLE_WORKSPACE_NAV" = true ]; then
+    disable_workspace_nav
+fi
 
 # Apply Hyprland setting changes
 apply_hypr_edits
@@ -8681,6 +9698,38 @@ fi
 
 if [ "$HIDE_CLOCK_DATE" = true ]; then
     hide_clock_date
+fi
+
+if [ "$SHOW_CLOCK_SECONDS" = true ]; then
+    show_clock_seconds
+fi
+
+if [ "$HIDE_CLOCK_SECONDS" = true ]; then
+    hide_clock_seconds
+fi
+
+if [ "$ENABLE_SUPERSONIC" = true ]; then
+    enable_supersonic_music
+fi
+
+if [ "$DISABLE_SUPERSONIC" = true ]; then
+    disable_supersonic_music
+fi
+
+if [ "$ENABLE_LOCAL_STATS" = true ]; then
+    enable_local_router_stats
+fi
+
+if [ "$DISABLE_LOCAL_STATS" = true ]; then
+    disable_local_router_stats
+fi
+
+if [ "$ENABLE_GROK_USAGE" = true ]; then
+    enable_grok_usage
+fi
+
+if [ "$DISABLE_GROK_USAGE" = true ]; then
+    disable_grok_usage
 fi
 
 if [ "$SHOW_WINDOW_TITLE" = true ]; then

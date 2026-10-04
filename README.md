@@ -20,12 +20,15 @@ A two-panel TUI (Terminal User Interface) debloater and optimizer for Omarchy Li
 - **Hyprland Configurator** with 66 settings across 4 categories (General, Decoration, Input, Gestures)
 - **Multi-monitor management** with detection, positioning, primary monitor, and laptop auto-off
 - **ASUS ROG hardware control** via asusctl (platform profiles, Aura RGB, Slash Ledbar, fan curves, GPU MUX, battery management, power tuning, AniMe Matrix, and more)
-- **30 configuration tweaks** for keybindings, display, system, appearance, keyboard, and utilities
+- **32 configuration tweaks** for keybindings, display, system, appearance, keyboard, and utilities
 - **Backup & restore** config directories with a single selection
 - **Summary screen** after all actions complete
+- **Privacy & OPSEC** — opt-in recent-file, dedicated LocalSearch indexing and Nautilus thumbnail controls, with separate confirmed one-shot purges
+- **OS Hardening** — bounded status audit and individually confirmed reversible sysctl controls
+- **Custom Kernel** — read-only linux-tkg checkout/config hints, local package metadata and an unexecuted build-command preview
 - Safe removal with confirmation prompts
-- **No installation required** - just run the one-liner command!
-- No external dependencies beyond what Omarchy ships (`jq`, `hyprctl`)
+- **No installation required for the single-file features** - run the one-liner command; optional checkout-backed menus require the full repository and their listed dependencies
+- Core TUI uses Omarchy tools (`jq`, `hyprctl`); optional feature requirements are listed below
 
 ## Quick Start (One-Liner)
 
@@ -59,7 +62,8 @@ chmod +x a-la-carchy.sh
 - Battery with kernel `charge_control_end_threshold` support for battery charge limit (optional, shows error if unavailable)
 - `asusctl` for ASUS ROG hardware control (optional, shows error if unavailable)
 - `python-pywal` (AUR) for Themarchy wallpaper-based theming (optional, offered for install automatically)
-- No other external dependencies - works out of the box!
+- The three security/kernel menus require the **full local checkout and Python 3**, not the single-file curl/download launcher. Privacy additionally requires Nautilus as the default directory handler, supported GSettings schemas, `gsettings`, `dconf` and, for indexing, the stock LocalSearch user units. Hardening requires supported kernel sysctls and sudo only after explicit confirmation. Kernel inspection uses Git; installed-package reporting uses pacman when available.
+- Other optional features have their own requirements above; missing/unsupported backends are reported, not installed by the new menus.
 
 ## How to Use
 
@@ -73,7 +77,7 @@ chmod +x a-la-carchy.sh
    - **Enter** Confirm and execute selected actions
    - **Q** Quit
 3. Type `yes` when prompted to confirm
-4. Choose **Apply all** at the master confirmation to skip individual prompts, or confirm each action one by one
+4. Choose **Apply all** at the master confirmation to skip individual prompts, or confirm each action one by one. **Privacy & OPSEC**, **OS Hardening** and **Custom Kernel** instead open immediately with **Space**: their changes require their own confirmation and are never selected by Apply all.
 
 ## What It Does
 
@@ -89,6 +93,18 @@ The script can remove the following preinstalled applications:
 - **Development**: Docker (Core Engine, Buildx, Compose)
 - **Security**: 1Password, 1Password CLI
 - **Utilities**: Calculator (gnome-calculator)
+
+### Remove Voice Dictation
+
+Choose **System → Dictation → Remove** to uninstall supported voice-dictation applications together. **Keep** does nothing; it does not reinstall anything.
+
+- Native packages: `voxtype`, `voxtype-bin`, `voxtype-git`, `hyprwhspr`, `hyprwhspr-bin`, `hyprwhspr-git`, `nerd-dictation`, `nerd-dictation-git`, `speech-note`, `speech-note-bin`, and `speech-note-git`.
+- Flatpak: Speech Note (`net.mkiol.SpeechNote`) in the current user's and default system installations.
+- Shows the exact installed targets before removal. Stops/disables known native app user services first, removes packages, checks for remaining targets, and reloads Hyprland so Omarchy drops its conditional Voxtype shortcuts.
+- Preserves user configurations, downloaded models, recordings, and shared audio, speech, input and AI libraries. Uses nonrecursive package removal, not forced dependency removal or blanket orphan cleanup. Pacman may ask for its own confirmation even after **Apply all**.
+- Reports inventory, service, removal and reload failures. If removal fails after stopping services, those services may need to be restarted manually.
+
+This is an explicit allowlist, **not a guarantee that every possible dictation tool is detected**. Common commands left on `PATH` are reported for manual removal using their original installer. Arbitrary pip/uv installations, AppImages, custom Flatpak installations, other users' applications, and voice features embedded in general-purpose apps are not removed. Custom keybindings are left intact. Package-manager errors are not suppressed.
 
 ### Remove Web Apps
 
@@ -111,6 +127,29 @@ The script can also remove the following preinstalled Omarchy webapps:
 | Bind/Unbind theme menu | ALT+T for Omarchy theme selector |
 | Swap Alt and Super keys | macOS-like modifier key layout |
 | Restore Alt/Super keys | Return to default modifier layout |
+| Workspace nav: HyDE | SUPER+CTRL+LEFT/RIGHT switch to the previous/next workspace on the focused monitor, like HyDE |
+| Workspace nav: Omarchy | Restores Omarchy's SUPER+CTRL+LEFT/RIGHT (move focus within a window group) |
+
+#### HyDE Workspace Navigation
+
+HyDE binds SUPER+CTRL+LEFT/RIGHT to Hyprland's `r-1`/`r+1` workspace selectors. Omarchy binds those keys to grouped-window focus instead, and its closest workspace keys, SUPER+TAB / SUPER+SHIFT+TAB, use `e+1`/`e-1`, which behave differently. **Workspace nav: HyDE** writes a managed `workspace-nav` block at the end of `~/.config/hypr/bindings.lua`. The block unbinds Omarchy's two grouped-window focus binds and binds the keys with the same native dispatcher HyDE uses, `hl.dsp.focus({ workspace = "r-1" })` / `"r+1"`. No scripts are installed.
+
+| Keys | Moves through | Empty workspaces | At either end | Other monitors |
+|------|---------------|------------------|---------------|----------------|
+| SUPER+CTRL+LEFT/RIGHT (this option) | Workspace numbers on the focused monitor | Included: RIGHT past your last workspace opens a new empty one, LEFT can land on an unused lower number | LEFT stays on the lowest number (no wrap-around), RIGHT always goes one higher | Skips numbers open on another monitor or assigned to one by a workspace rule (such as **Primary monitor**) |
+| SUPER+TAB / SUPER+SHIFT+TAB (Omarchy, unchanged) | Existing workspaces on all monitors, in number order | Unused numbers skipped; existing empty/persistent workspaces included | Wraps around | Can switch focus to another monitor |
+
+For example, with workspaces 1 and 3 on the left monitor and 2 and 4 on the right, SUPER+TAB from 1 goes 2 (right monitor), 3, 4, then back to 1. On the left monitor, SUPER+CTRL+RIGHT goes 1, 3, then 5 (a new empty workspace, since 4 is on the other monitor), and SUPER+CTRL+LEFT steps back through 3 to 1. Hyprland drops an empty workspace once you leave it, unless a workspace rule marks it persistent. If **Workspace back-forth** (Hyprland → General) is on, SUPER+CTRL+LEFT on the lowest workspace jumps to your previous workspace instead of staying put. SUPER+1…0 and SUPER+CTRL+TAB (former workspace) are not changed.
+
+Grouped-window focus stays available on SUPER+ALT+TAB / SUPER+ALT+SHIFT+TAB, which are Omarchy binds with the same dispatchers.
+
+**Conflicts:** the option scans `~/.config/hypr/*.lua` for single-line literal `o.bind`, `o.bind_toggle`, and `hl.bind` calls on SUPER+CTRL+LEFT/RIGHT (including modifier aliases, reordered modifiers, single/double quotes, and Keybind Editor edits). If found, it lists those lines and changes nothing. This is a conservative text scan, not a Lua parser: multiline calls, computed keys, custom wrappers, and modules outside that directory need manual checking; commented-out code may also require inspection. It also refuses if Omarchy's defaults bind those keys in a way the block's `hl.unbind` can't remove, because `hl.unbind` matches the key string itself, not the key combination. The block is kept after the Keybind Editor's block, so moving Omarchy's grouped-window focus to other keys can't unbind it. The Keybind Editor still lists Omarchy's grouped-window focus entries on SUPER+CTRL+LEFT/RIGHT while this option is on. **Workspace nav: Omarchy** removes the block, which brings Omarchy's binds back.
+
+To check the live result (modmask 68 is SUPER+CTRL), this should print only `Previous workspace on monitor` and `Next workspace on monitor`:
+
+```bash
+hyprctl binds -j | jq -r '.[] | select(.modmask == 68 and ((.key | ascii_upcase) == "LEFT" or (.key | ascii_upcase) == "RIGHT")) | .description'
+```
 
 #### Keybind Editor
 
@@ -357,12 +396,26 @@ All items below are in the **Appearance** category in the TUI.
 | Disable 12-hour clock | 24-hour format |
 | Show clock date | Display day name on clock (e.g. "Sunday 10:55 AM") |
 | Hide clock date | Show time only (e.g. "10:55 AM") |
+| Show clock seconds | **Appearance → Clock seconds → Show**: display `HH:mm:ss` (or `h:mm:ss AP` in 12-hour mode), preserving the day-name preference |
+| Hide clock seconds | Hide seconds without changing the day-name or 12/24-hour preference |
+| Enable Supersonic music | **Appearance → Supersonic music → Enable**: native artist/track/album/year display, play/pause/previous/next controls and song/album library search for an already-running Supersonic (requires full checkout + Python 3) |
+| Disable Supersonic music | Restore the replaced stock media entry (or remove the added entry); retain plugin files and unrelated settings |
 | Show window title | Display active window name next to workspaces |
 | Hide window title | Remove active window name from the bar |
 | Enable media directories | Screenshots → `~/Pictures/Screenshots`, Recordings → `~/Videos/Screencasts` (via `~/.config/uwsm/default`, applies after next login) |
 | Disable media directories | Use default `~/Pictures` and `~/Videos` |
 
 Bar tweaks edit `~/.config/omarchy/shell.json` (through `omarchy bar` where possible); the shell picks up changes immediately.
+
+**Clock seconds:** the stock Omarchy clock updates once a minute, so a format change alone would show stale seconds. Selecting **Show** uses Omarchy's supported plugin-clone mechanism to create or reuse your local `<username>.clock` and enables second-by-second updates while seconds are displayed. Package-owned files are never edited. Existing supported clock clones are backed up before the precision binding is changed; unfamiliar custom implementations are refused rather than overwritten. **Hide** retains the clone, restores minute updates for the managed clock, and leaves your other clock preferences intact. Qt uses lowercase `mm` for minutes and `ss` for seconds: the 24-hour format is `HH:mm:ss`.
+
+#### Supersonic Music
+
+Optional native widget for **Supersonic 0.22.1**: **Appearance → Supersonic music → Enable** stages `alacarchy.supersonic` under your user plugins and reversibly replaces a single stock media entry (or adds one without removing custom widgets). Run from the **full checkout**, not the single-file curl launcher. No app installation/launch, server credentials, package-owned edits or MPRIS-service changes. Disable restores the stock entry and keeps plugin files.
+
+Bar controls retain Omarchy's map: **left play/pause, middle next, right dropdown, scroll up/down previous/next**. The dropdown searches real songs/albums and requests playback by ID. Year is obtained from actual IPC library metadata with an exact track-ID match; missing years show **Year unknown**. IPC does not report playing/paused state, and upstream playback acknowledgments do not prove playback succeeded; the UI says **Playback requested**, not verified playing. Missing app, empty queue, timeout, errors and no matches are explicit.
+
+See [Supersonic setup, privacy boundaries, tests and live acceptance checklist](extras/supersonic/README.md). Saving user plugin/layout files can activate them through shell hot reload; repository/headless verification is not permission or proof of live installation.
 
 #### System Features
 
@@ -449,6 +502,72 @@ When a battery charge limit is set (any value other than 100%), the Omarchy menu
 |-------|------|-------------|
 | Backup config | action | Create a timestamped backup of your Omarchy configuration |
 | Menu shortcut | toggle | Add or remove A La Carchy from the Omarchy launcher menu |
+
+### Privacy & OPSEC
+
+Run from a full local checkout as your normal user. Open a control with **Space**, inspect its status and tradeoff, choose **1) Stop future recording** or **2) Restore owned original**, then confirm with `yes`. No global privacy preset is offered.
+
+| Control | Exact scope and tradeoff |
+|---|---|
+| Recent file recording | Sets `org.gnome.desktop.privacy remember-recent-files=false` and `gtk-recent-files-enabled=false` in `$XDG_CONFIG_HOME/gtk-{3,4}.0/settings.ini`. Recent lists become less useful. Restart GTK applications yourself; independent application, browser and shell histories are outside scope. Existing history stays. |
+| Dedicated file indexing | Masks/stops only `localsearch-3.service` and `localsearch-control-3.service` in the user manager, including activation through those units. Only stock static package units without custom overrides are supported. Search may degrade; the existing index is retained. No GVFS, portals, shared D-Bus, writeback or security services are changed. |
+| Nautilus thumbnails | Sets `org.gnome.nautilus.preferences show-image-thumbnails` to `'never'`. Nautilus previews disappear; other applications may still generate thumbnails. Existing cache stays. |
+| Purge recent list | Deletes only `$XDG_DATA_HOME/recently-used.xbel` (default `~/.local/share/recently-used.xbel`). |
+| Purge thumbnail cache | Deletes only `$XDG_CACHE_HOME/thumbnails` (default `~/.cache/thumbnails`). Symlinks, hardlinks and special files are refused. |
+
+**Purge is separate from stopping recording:** close applications that can rewrite the data first; the menu does not kill them. Each purge requires `yes` and the literal `PURGE`. It is irreversible one-shot deletion, **not secure erasure**, and creates **no backup of sensitive history/cache**. It does not change recording settings. Index-database deletion is not offered; concurrent writers or errors can leave a partial purge.
+
+Configuration ownership journals live under `$XDG_STATE_HOME/a-la-carchy/privacy/` (default `~/.local/state/a-la-carchy/privacy/`). They preserve prior explicit/unset GSettings values, GTK configuration bytes and supported user-service activity, not recent-file contents. **Restore** restores owned originals only after conflict checks; newer edits, unknown layouts, missing tools/schemas and unsupported service definitions are refused. Failures may leave partial configuration changes: use Restore/review before retrying, and retain the journal. Dedicated XDG roots must be inside an owned, non-symlinked HOME; unsafe paths are refused.
+
+**Close GTK applications and configuration editors before Stop or Restore, and keep them closed until the command returns.** The configurator does not kill writers. GTK writes/deletions retain the caller-checked bytes and pin the target descriptor/inode before content validation, checking bytes and inode/version again before mutation. Detected newer edits are left intact and the recovery journal is retained. This is not universal atomic compare-and-swap: a noncooperating same-UID writer can still change a target, parent or temporary path after the last check and before POSIX rename/unlink, or change settings between readback and journal completion. The operation lock coordinates only this configurator; multi-resource changes and GSettings/service commands are not atomic transactions.
+
+For a later, separately authorized narrow file-history change, the equivalent commands from the checkout are:
+
+```bash
+# Read status first; these commands do not enable controls.
+python3 extras/privacy/control.py recent status
+python3 extras/privacy/control.py indexing status
+
+# Explicit opt-in: recent recording and only its dedicated indexer/proxy.
+python3 extras/privacy/control.py recent stop --confirm CHANGE
+python3 extras/privacy/control.py recent status
+python3 extras/privacy/control.py indexing stop --confirm CHANGE
+python3 extras/privacy/control.py indexing status
+
+# Restore only the originals owned by these controls; verify again.
+python3 extras/privacy/control.py indexing restore --confirm CHANGE
+python3 extras/privacy/control.py recent restore --confirm CHANGE
+python3 extras/privacy/control.py indexing status
+python3 extras/privacy/control.py recent status
+```
+
+These are manual instructions, not automatic application. Do not source the top-level TUI for inspection. No purge is needed to enable or restore a control, and no purge is included in this narrow sequence.
+
+### OS Hardening
+
+**Security status audit** reads four sysctls and their bounded persistence/ownership status without privilege or writes. It is **not a security certification**. Open an individual control with **Space**, choose **Enable** or **Restore owned original**, and confirm with `yes`; sudo is requested only for the confirmed change.
+
+| Control | Opt-in target | Cost / refusal boundary |
+|---|---|---|
+| Kernel pointer exposure | `kernel.kptr_restrict=2` | Zeros `%pK` pointers regardless of privilege, not every address disclosure; affects debugging/profiling. |
+| Kernel log access | `kernel.dmesg_restrict=1` | Requires CAP_SYSLOG for kernel-log access; affects unprivileged troubleshooting, not auditing/log retention. |
+| Restricted ptrace | `kernel.yama.ptrace_scope=1` | Normally descendants/declared tracers only; affects debugger attachment/crash tooling, requires Yama. Existing values 2/3 are never lowered. |
+| Unprivileged BPF | `kernel.unprivileged_bpf_disabled=2` | Reversible restriction on supporting kernels; affects unprivileged BPF tools. Irreversible-until-reboot value 1 is never written or lowered. |
+
+Each control writes only `/etc/sysctl.d/99-a-la-carchy-{kptr,dmesg,ptrace,bpf}.conf` for its own key, then changes that one runtime key with readback. It never runs broad `sysctl --system`. Competing assignments/globs, existing dedicated-path files without ownership, unsupported values and newer edits are refused. Already equally/more restrictive unmanaged settings are not taken over or made persistent. Journals under `$XDG_STATE_HOME/a-la-carchy/hardening/` preserve the original runtime value; **Restore** removes only the owned dedicated file and restores that runtime value. Partial failures require Restore/manual review before retrying. Audit/authentication/sandbox/firewall services, user namespaces and boot settings are not changed.
+
+Persistence input is a Linux kernel-sealed `memfd`, verified against the fixed one-key rendering **after sealing**, then passed on stdin to native `sudo -- /usr/bin/install` via `/proc/self/fd/0`. No elevated script or mutable user payload path is used. Missing/failed sealing refuses before privilege is requested; readable proc descriptors and compatible native install/sudo handling are required. Local tests use real unprivileged install with disposable targets and mocked privilege; real sudo policy, live sysctl support and reboot persistence still require separate authorized acceptance.
+
+### Custom Kernel (read-only)
+
+Open **Choose checkout path** to explicitly choose an absolute linux-tkg repository root for this TUI session, or launch the full checkout with `ALC_LINUX_TKG_PATH=/your/checkout bash a-la-carchy.sh`. The literal default `/home/git/linux-tkg` is **not silently repaired or replaced**. At this checkpoint it was absent; `/home/typhoon/git/linux-tkg` was detected separately with user-owned dirty configuration and was left untouched.
+
+- **Inspect kernel checkout** validates the exact owned checkout/`.git` directory and reads bounded HEAD/loose-or-packed refs as **data-only identity hints**, plus literal source hints from `customization.cfg`, environment override *names*, running kernel and installed kernel-package information when available. **No Git process runs on the checkout**: Git config, hooks, attributes and filters are not interpreted. Tracked dirty state is explicitly **unknown/not computed**, since Git status can execute configured filters. Objects, effective Git worktree/ref backend and recursive untracked/generated files are not verified. Linked worktrees, symlinked/untrusted paths and oversized/unsupported metadata are refused or reported unknown.
+- Effective configuration remains **unknown**: local README precedence is `customization.cfg` < external configuration < environment, with shell logic, interactive choices, fragments and patches also relevant. Configurations/PKGBUILD are **never sourced or evaluated**, and external config contents are not read.
+- **Local package metadata** reads only name/version/architecture from early `.PKGINFO` entries in bounded top-level local `.pkg.tar.{zst,xz,gz}` archives. It does not extract payloads, execute scripts, install packages or prove archive payload integrity/bootability; unsupported archives are reported.
+- **Build command preview** displays a shell-quoted `cd -- <verified-root> && makepkg` derived from the local README's Arch recipe, marked **NOT EXECUTED**. Dependency-sync/install flags are deliberately omitted. A later real build would execute checkout code and may download sources; review it separately first.
+
+No compilation, package installation, initramfs/signing, boot/default/image/fallback changes or reboot is performed. Installed/running kernel metadata is not next-boot proof. BORE/scheduler, LTO and CPU tuning are performance choices, **not hardening**; disabling mitigations weakens protection. Trimmed module sets can omit storage/encryption/recovery drivers, so a future kernel workflow needs a separately verified known-good fallback.
 
 ### ROG Hardware Control
 
@@ -983,8 +1102,8 @@ The entry launches this checkout when A La Carchy was run from a file, or the pu
 - Confirmation prompt before every action
 - Shows exactly what will be removed
 - Uses `-Rns` flags to remove dependencies safely
-- Timestamped backups created before modifying any config file
-- Backup runs before any config modifications when selected with tweaks
+- Legacy config tweaks use timestamped backups; the new privacy/hardening controls instead retain owned-original configuration journals for conflict-checked Restore. One-shot history/cache purges intentionally create no backup.
+- Optional backup selection covers queued legacy tweaks; the new menus act immediately after their own confirmation and use the separate Restore journals described above
 - Config backup follows symlinks to preserve actual file content
 - Restore script lists all backups and lets you choose which to restore
 - Restore script prompts for confirmation before overwriting
@@ -1038,7 +1157,7 @@ The script can remove the following Omarchy webapps (stored as `.desktop` files 
 
 ## Configuration Files Modified
 
-All edits to shared config files live in marked blocks (`-- >>> a-la-carchy <name>` … `-- <<< a-la-carchy <name>`), so they can be updated or removed cleanly. A timestamped backup is taken before each change. Files under `$OMARCHY_PATH` (`/usr/share/omarchy`) are only read, never modified.
+Legacy shared Lua config edits live in marked blocks (`-- >>> a-la-carchy <name>` … `-- <<< a-la-carchy <name>`) with timestamped backups. The privacy/hardening controls above use separate owned-original journals, GSettings/user-service controls, GTK INI markers and dedicated sysctl files; history/cache purge has no backup. Files under `$OMARCHY_PATH` (`/usr/share/omarchy`) are only read, never modified.
 
 | File | Used for |
 |------|----------|
