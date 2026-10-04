@@ -72,48 +72,14 @@ declare -a SUMMARY_LOG=()
 # When true, skip individual confirmation prompts (user chose "Apply all")
 CONFIRM_ALL=false
 
-# Hyprland tiling config path
-TILING_CONF="$HOME/.local/share/omarchy/default/hypr/bindings/tiling-v2.conf"
-
-# Hyprland monitors config path
-MONITORS_CONF="$HOME/.config/hypr/monitors.conf"
-
-# Hyprland bindings config path
-BINDINGS_CONF="$HOME/.config/hypr/bindings.conf"
-
-# XCompose config path
-XCOMPOSE_CONF="$HOME/.XCompose"
-
-# Hyprland input config path
-INPUT_CONF="$HOME/.config/hypr/input.conf"
-
-# Suspend state file path
-SUSPEND_STATE="$HOME/.local/state/omarchy/toggles/suspend-on"
-
-# Waybar config paths
-WAYBAR_CONF="$HOME/.config/waybar/config.jsonc"
-WAYBAR_CONF_STYLE="$HOME/.config/waybar/style.css"
-
-# Hyprland looknfeel config path
-LOOKNFEEL_CONF="$HOME/.config/hypr/looknfeel.conf"
+# Omarchy flag file that removes Suspend from the system menu (present = suspend disabled)
+SUSPEND_OFF_FLAG="$HOME/.local/state/omarchy/toggles/suspend-off"
 
 # UWSM defaults config path
 UWSM_DEFAULT="$HOME/.config/uwsm/default"
 
-# Managed-block markers for laptop auto-off
-LAPTOP_AUTO_MARKER_START="# >>> managed by a-la-carchy laptop-display"
-LAPTOP_AUTO_MARKER_END="# <<< managed by a-la-carchy laptop-display"
-
 # Laptop auto-off script path
 LAPTOP_AUTO_SCRIPT="$HOME/.config/hypr/scripts/laptop-display-auto.sh"
-
-# Managed-block markers for power profile
-POWER_PROFILE_MARKER_START="# >>> managed by a-la-carchy power-profile"
-POWER_PROFILE_MARKER_END="# <<< managed by a-la-carchy power-profile"
-
-# Managed-block markers for primary monitor
-PRIMARY_MONITOR_MARKER_START="# >>> managed by a-la-carchy primary-monitor"
-PRIMARY_MONITOR_MARKER_END="# <<< managed by a-la-carchy primary-monitor"
 
 # Power profile startup script path
 POWER_PROFILE_SCRIPT="$HOME/.config/hypr/scripts/power-profile-default.sh"
@@ -125,16 +91,8 @@ BATTERY_LIMIT_UDEV_RULE="/etc/udev/rules.d/99-battery-charge-limit.rules"
 POWER_AUTO_SWITCH_UDEV_RULE="/etc/udev/rules.d/99-power-profile.rules"
 POWER_AUTO_SWITCH_SCRIPT="$HOME/.config/hypr/scripts/power-profile-auto-switch.sh"
 
-# Managed-block markers for power menu charge limit override
-POWER_MENU_MARKER_START="# === a-la-carchy power-menu charge-limit ==="
-POWER_MENU_MARKER_END="# === end a-la-carchy power-menu charge-limit ==="
-
-# Battery limit helper script path (called from walker menu, uses pkexec)
+# Battery limit helper script path (called from the Omarchy menu, uses pkexec)
 BATTERY_LIMIT_HELPER="$HOME/.config/hypr/scripts/omarchy-battery-limit.sh"
-
-# Omarchy default window/browser config paths (for transparency toggle)
-WINDOWS_CONF="$HOME/.local/share/omarchy/default/hypr/windows.conf"
-BROWSER_CONF="$HOME/.local/share/omarchy/default/hypr/apps/browser.conf"
 
 # Check if running as root
 if [[ $EUID -eq 0 ]]; then
@@ -143,32 +101,242 @@ if [[ $EUID -eq 0 ]]; then
     exit 1
 fi
 
-# Extract managed blocks from monitors.conf so they survive full rewrites
-# Stores result in MONITORS_MANAGED_BLOCKS variable
-save_managed_blocks() {
-    MONITORS_MANAGED_BLOCKS=""
-    [[ -f "$MONITORS_CONF" ]] || return
-    local markers=(
-        "$POWER_PROFILE_MARKER_START|$POWER_PROFILE_MARKER_END"
-        "$LAPTOP_AUTO_MARKER_START|$LAPTOP_AUTO_MARKER_END"
-        "$PRIMARY_MONITOR_MARKER_START|$PRIMARY_MONITOR_MARKER_END"
-    )
-    for pair in "${markers[@]}"; do
-        local start="${pair%%|*}"
-        local end="${pair##*|}"
-        local block
-        block=$(awk -v s="$start" -v e="$end" '$0==s{f=1} f{print} $0==e{f=0}' "$MONITORS_CONF")
-        if [[ -n "$block" ]]; then
-            MONITORS_MANAGED_BLOCKS+=$'\n'"$block"
-        fi
-    done
+# This version targets Omarchy's Lua-based Hyprland config
+if [[ ! -f "$HOME/.config/hypr/hyprland.lua" ]]; then
+    echo "Error: ~/.config/hypr/hyprland.lua not found."
+    echo "A La Carchy needs an Omarchy release with the Lua Hyprland config."
+    echo "Run 'omarchy update' first."
+    exit 1
+fi
+
+# Published script, used when the menu entry has no local checkout to run
+ALC_SCRIPT_URL="https://raw.githubusercontent.com/DanielCoffey1/a-la-carchy/master/a-la-carchy.sh"
+
+# Omarchy's Hyprland config is Lua; a-la-carchy edits live in marked blocks
+# inside the user files so they can be updated or removed cleanly.
+HYPR_DIR="$HOME/.config/hypr"
+# Omarchy menu extension (JSONC); a-la-carchy entries live between markers
+MENU_JSONC="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+MENU_MARKER_START="  // >>> a-la-carchy menu entry"
+MENU_MARKER_END="  // <<< a-la-carchy menu entry"
+BINDINGS_LUA="$HYPR_DIR/bindings.lua"
+MONITORS_LUA="$HYPR_DIR/monitors.lua"
+INPUT_LUA="$HYPR_DIR/input.lua"
+LOOKNFEEL_LUA="$HYPR_DIR/looknfeel.lua"
+HYPRLAND_LUA="$HYPR_DIR/hyprland.lua"
+OMARCHY_DIR="${OMARCHY_PATH:-/usr/share/omarchy}"
+
+lua_block_has() {
+    [[ -f "$1" ]] && grep -qxF -- "-- >>> a-la-carchy $2" "$1"
 }
 
-# Re-append saved managed blocks to monitors.conf after a rewrite
-restore_managed_blocks() {
-    if [[ -n "${MONITORS_MANAGED_BLOCKS:-}" ]]; then
-        echo "$MONITORS_MANAGED_BLOCKS" >> "$MONITORS_CONF"
+# Print the body of a managed Lua block
+lua_block_get() {
+    [[ -f "$1" ]] || return 0
+    awk -v s="-- >>> a-la-carchy $2" -v e="-- <<< a-la-carchy $2" '
+        $0 == e { f = 0 }
+        f { print }
+        $0 == s { f = 1 }
+    ' "$1"
+}
+
+lua_block_remove() {
+    local file="$1" start="-- >>> a-la-carchy $2" end="-- <<< a-la-carchy $2"
+    [[ -f "$file" ]] || return 0
+    # Drop the block and the blank line written before it. A blank line is held
+    # back until we know whether a block starts right after it.
+    awk -v s="$start" -v e="$end" '
+        $0 == s { skip = 1; held = 0; next }
+        $0 == e { skip = 0; next }
+        skip { next }
+        held { print ""; held = 0 }
+        $0 == "" { held = 1; next }
+        { print }
+        END { if (held) print "" }
+    ' "$file" > "${file}.tmp" && cat "${file}.tmp" > "$file"
+    rm -f "${file}.tmp"
+}
+
+# Replace (or add) a managed Lua block at the end of a file
+lua_block_write() {
+    local file="$1" id="$2" content="$3"
+    lua_block_remove "$file" "$id"
+    {
+        echo ""
+        echo "-- >>> a-la-carchy $id"
+        echo "$content"
+        echo "-- <<< a-la-carchy $id"
+    } >> "$file"
+}
+
+AUTOSTART_LUA="$HYPR_DIR/autostart.lua"
+
+# Lua that runs a command once when Hyprland starts
+lua_on_start() {
+    printf 'hl.on("hyprland.start", function()\n  hl.exec_cmd("%s")\nend)' "$1"
+}
+
+SHELL_JSON="$HOME/.config/omarchy/shell.json"
+
+# Is a widget on the shell bar?
+shell_bar_has() {
+    [[ -f "$SHELL_JSON" ]] && jq -e --arg id "$1" '[.bar.layout[]?[]? | .id] | index($id) != null' "$SHELL_JSON" &>/dev/null
+}
+
+# Read a bar widget setting (prints nothing if unset)
+shell_bar_get() {
+    jq -r --arg id "$1" --arg key "$2" \
+        'first(.bar.layout[]?[]? | select(.id == $id) | .[$key]) // empty' "$SHELL_JSON" 2>/dev/null
+}
+
+# Rewrite shell.json through jq (args are passed to jq before the file).
+# Writes in place so the file keeps its permissions; the shell reloads it itself.
+shell_json_jq() {
+    local tmp rc
+    tmp=$(mktemp) || return 1
+    jq "$@" "$SHELL_JSON" > "$tmp" && cat "$tmp" > "$SHELL_JSON"
+    rc=$?
+    rm -f "$tmp"
+    return $rc
+}
+
+# Remove a widget from every bar section
+shell_bar_remove() {
+    shell_json_jq --arg id "$1" '.bar.layout |= with_entries(.value |= map(select(.id != $id)))'
+}
+
+# Run a shell-bar change with the standard confirm/backup/log flow.
+# Usage: apply_shell_change <title> <explanation> <summary> <check-fn> <apply-fn>
+# check-fn returns 0 when the change is already in place.
+apply_shell_change() {
+    local title="$1" explain="$2" summary="$3" check_fn="$4" apply_fn="$5"
+
+    clear
+    echo
+    echo
+    echo -e "${BOLD}  $title${RESET}"
+    echo
+    echo -e "  ${DIM}$explain${RESET}"
+    echo
+    echo
+
+    if [[ ! -f "$SHELL_JSON" ]] || ! command -v jq &>/dev/null; then
+        echo -e "  ${DIM}✗${RESET}  Omarchy shell config not found at $SHELL_JSON (or jq missing)"
+        echo
+        SUMMARY_LOG+=("✗  $summary -- failed (shell config not found)")
+        return 1
     fi
+
+    if "$check_fn"; then
+        echo -e "  ${DIM}Already set. Nothing to do.${RESET}"
+        echo
+        SUMMARY_LOG+=("--  $summary -- already set")
+        return 0
+    fi
+
+    confirm_continue "$summary" || return 0
+    backup_file "$SHELL_JSON"
+
+    if "$apply_fn"; then
+        echo -e "  ${CHECKED}✓${RESET}  $summary"
+        SUMMARY_LOG+=("✓  $summary")
+    else
+        echo -e "  ${DIM}✗${RESET}  $summary -- failed"
+        SUMMARY_LOG+=("✗  $summary -- failed")
+    fi
+    echo
+}
+
+# Ask to continue unless running with confirm-all; returns 1 when cancelled
+confirm_continue() {
+    if [[ "$CONFIRM_ALL" != true ]]; then
+        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
+        read -r < /dev/tty
+        if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+            echo
+            echo "  Cancelled."
+            echo
+            SUMMARY_LOG+=("--  $1 -- cancelled")
+            return 1
+        fi
+    fi
+    echo
+    return 0
+}
+
+backup_file() {
+    local backup="${1}.backup.$(date +%Y%m%d_%H%M%S)"
+    cp "$1" "$backup"
+    echo -e "  ${DIM}Backup: $backup${RESET}"
+}
+
+# Reload Hyprland and report any config errors the change introduced
+hypr_reload_check() {
+    command -v hyprctl &>/dev/null && [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] || return 0
+    hyprctl reload &>/dev/null
+    sleep 0.5
+    local errors
+    errors=$(hyprctl configerrors 2>/dev/null | sed '/^[[:space:]]*$/d')
+    if [[ -n "$errors" ]]; then
+        echo -e "  ${BOLD}Hyprland reported config errors:${RESET}"
+        echo "$errors" | sed 's/^/    /'
+        echo
+        return 1
+    fi
+    return 0
+}
+
+# Add or remove a managed Lua block with the standard confirm/backup/log flow.
+# Usage: apply_lua_block <title> <explanation> <file> <block-id> <summary> [content]
+# With content the block is written; without it the block is removed.
+apply_lua_block() {
+    local title="$1" explain="$2" file="$3" id="$4" summary="$5" content="${6:-}"
+
+    clear
+    echo
+    echo
+    echo -e "${BOLD}  $title${RESET}"
+    echo
+    echo -e "  ${DIM}$explain${RESET}"
+    echo
+    echo
+
+    if [[ ! -f "$file" ]]; then
+        echo -e "  ${DIM}✗${RESET}  ${file##*/} not found at $file"
+        echo
+        SUMMARY_LOG+=("✗  $summary -- failed (config not found)")
+        return 1
+    fi
+
+    if [[ -z "$content" ]] && ! lua_block_has "$file" "$id"; then
+        echo -e "  ${DIM}Not set. Nothing to do.${RESET}"
+        echo
+        SUMMARY_LOG+=("--  $summary -- not set")
+        return 0
+    fi
+    if [[ -n "$content" ]] && lua_block_has "$file" "$id" && [[ "$(lua_block_get "$file" "$id")" == "$content" ]]; then
+        echo -e "  ${DIM}Already set. Nothing to do.${RESET}"
+        echo
+        SUMMARY_LOG+=("--  $summary -- already set")
+        return 0
+    fi
+
+    confirm_continue "$summary" || return 0
+
+    backup_file "$file"
+    if [[ -n "$content" ]]; then
+        lua_block_write "$file" "$id" "$content"
+    else
+        lua_block_remove "$file" "$id"
+    fi
+
+    if hypr_reload_check; then
+        echo -e "  ${CHECKED}✓${RESET}  $summary"
+        SUMMARY_LOG+=("✓  $summary")
+    else
+        SUMMARY_LOG+=("✗  $summary -- Hyprland reported config errors")
+    fi
+    echo
 }
 
 # Function to check if package is installed
@@ -182,146 +350,119 @@ is_webapp_installed() {
 }
 
 # Function to load all keybindings from config files for the Keybind Editor
-# Applies unbind/rebind overrides from bindings.conf so entries show current state
+# Applies unbind/rebind overrides from bindings.lua so entries show current state
+# Split Lua bind keys ("SUPER + SHIFT + W") into BIND_MODS ("SUPER SHIFT") and BIND_KEY ("W")
+split_lua_keys() {
+    local keys="$1"
+    BIND_KEY="${keys##* + }"
+    if [[ "$keys" == *" + "* ]]; then
+        BIND_MODS="${keys% + *}"
+        BIND_MODS="${BIND_MODS// + / }"
+    else
+        BIND_MODS=""
+    fi
+}
+
+# Join mods and key back into Lua bind keys
+join_lua_keys() {
+    if [[ -n "$1" ]]; then
+        echo "${1// / + } + $2"
+    else
+        echo "$2"
+    fi
+}
+
+# Parse a single-line top-level o.bind("KEYS", "Desc", action[, opts]) call.
+# Sets LB_KEYS, LB_DESC, LB_ACTION; returns 1 if the line isn't one.
+parse_lua_bind_line() {
+    [[ "$1" =~ ^o\.bind\(\"([^\"]+)\",\ \"([^\"]*)\",\ (.+)\)[[:space:]]*$ ]] || return 1
+    LB_KEYS="${BASH_REMATCH[1]}"
+    LB_DESC="${BASH_REMATCH[2]}"
+    LB_ACTION="${BASH_REMATCH[3]}"
+}
+
 load_all_bindings() {
     EDIT_BINDINGS_ITEMS=()
+    BINDING_LUA_ACTIONS=()
+    BINDING_ORIG_KEYS=()
 
-    # Phase 1: Load default config files (not bindings.conf)
-    local default_files=(
-        "$HOME/.local/share/omarchy/default/hypr/bindings/clipboard.conf"
-        "$HOME/.local/share/omarchy/default/hypr/bindings/tiling-v2.conf"
-        "$HOME/.local/share/omarchy/default/hypr/bindings/utilities.conf"
-        "$HOME/.local/share/omarchy/default/hypr/bindings/media.conf"
-    )
-    local file_labels=("Clipboard" "Tiling" "Utilities" "Media")
+    # Phase 1: Omarchy default bindings. Only single-line top-level o.bind calls
+    # are editable; loop-generated binds (workspaces) can't be rebound one by one.
+    local default_dir="$OMARCHY_DIR/default/hypr/bindings"
+    local default_files=(tiling clipboard utilities media applications)
+    local file_labels=("Tiling" "Clipboard" "Utilities" "Media" "Applications")
 
     for i in "${!default_files[@]}"; do
-        local file="${default_files[$i]}"
-        local label="${file_labels[$i]}"
-
+        local file="$default_dir/${default_files[$i]}.lua"
         [[ -f "$file" ]] || continue
 
-        EDIT_BINDINGS_ITEMS+=("HEADER|$label")
-
+        EDIT_BINDINGS_ITEMS+=("HEADER|${file_labels[$i]}")
         while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            [[ "$line" =~ ^bindd[[:space:]]*= ]] || continue
-
-            local content="${line#bindd = }"
-            content="${content#bindd=}"
-
-            IFS=',' read -ra parts <<< "$content"
-            [[ ${#parts[@]} -lt 4 ]] && continue
-
-            local mods="${parts[0]## }"
-            mods="${mods%% }"
-            local bkey="${parts[1]## }"
-            bkey="${bkey%% }"
-            local desc="${parts[2]## }"
-            desc="${desc%% }"
-            local dispatcher="${parts[3]## }"
-            dispatcher="${dispatcher%% }"
-            local args=""
-            if [[ ${#parts[@]} -gt 4 ]]; then
-                args="${parts[*]:4}"
-                args="${args## }"
-                args="${args%% }"
-            fi
-
-            EDIT_BINDINGS_ITEMS+=("bindd|$mods|$bkey|$desc|$dispatcher|$args|$file")
+            parse_lua_bind_line "$line" || continue
+            split_lua_keys "$LB_KEYS"
+            BINDING_LUA_ACTIONS+=("$LB_ACTION")
+            EDIT_BINDINGS_ITEMS+=("bindd|$BIND_MODS|$BIND_KEY|$LB_DESC|lua|$(( ${#BINDING_LUA_ACTIONS[@]} - 1 ))|$file")
         done < "$file"
     done
 
-    # Phase 2: Process bindings.conf overrides
-    # For each unbind+bindd pair, update the matching default entry in-place
-    # Non-override bindd entries are collected as user bindings
-    if [[ -f "$BINDINGS_CONF" ]]; then
-        # Build lookup: "MODS|KEY" -> EDIT_BINDINGS_ITEMS index
-        local -A binding_lookup=()
-        for idx in "${!EDIT_BINDINGS_ITEMS[@]}"; do
-            local entry="${EDIT_BINDINGS_ITEMS[$idx]}"
-            [[ "$entry" == HEADER* ]] && continue
-            IFS='|' read -r _t lk_mods lk_key _rest <<< "$entry"
-            binding_lookup["$lk_mods|$lk_key"]=$idx
-        done
+    [[ -f "$BINDINGS_LUA" ]] || return 0
 
-        # Process line-by-line to pair unbinds with rebinds
-        local -A pending_unbinds=()  # "MODS|KEY" -> 1
-        local -a user_entries=()
+    # Lookup: "MODS|KEY" -> EDIT_BINDINGS_ITEMS index
+    local -A binding_lookup=()
+    for idx in "${!EDIT_BINDINGS_ITEMS[@]}"; do
+        local entry="${EDIT_BINDINGS_ITEMS[$idx]}"
+        [[ "$entry" == HEADER* ]] && continue
+        IFS='|' read -r _t lk_mods lk_key _rest <<< "$entry"
+        binding_lookup["$lk_mods|$lk_key"]=$idx
+    done
 
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
+    # Phase 2: user bindings.lua. Our keybind-edits block holds unbind+rebind
+    # pairs that move a binding; other top-level o.bind calls are user bindings.
+    local -a user_entries=()
+    local pending_unbind="" in_edits=false
+    while IFS= read -r line; do
+        if [[ "$line" == "-- >>> a-la-carchy keybind-edits" ]]; then in_edits=true; continue; fi
+        if [[ "$line" == "-- <<< a-la-carchy keybind-edits" ]]; then in_edits=false; continue; fi
 
-            # Process unbind lines
-            if [[ "$line" =~ ^unbind[[:space:]]*=[[:space:]]*(.*) ]]; then
-                local ucontent="${BASH_REMATCH[1]}"
-                IFS=',' read -ra uparts <<< "$ucontent"
-                [[ ${#uparts[@]} -lt 2 ]] && continue
-                local u_mods="${uparts[0]## }"
-                u_mods="${u_mods%% }"
-                local u_key="${uparts[1]## }"
-                u_key="${u_key%% }"
-                local u_lookup="$u_mods|$u_key"
-                if [[ -n "${binding_lookup[$u_lookup]:-}" ]]; then
-                    pending_unbinds["$u_lookup"]=1
-                fi
+        if $in_edits && [[ "$line" =~ ^hl\.unbind\(\"([^\"]+)\"\) ]]; then
+            pending_unbind="${BASH_REMATCH[1]}"
+            continue
+        fi
+        parse_lua_bind_line "$line" || continue
+        split_lua_keys "$LB_KEYS"
+
+        if $in_edits && [[ -n "$pending_unbind" ]]; then
+            split_lua_keys "$pending_unbind"
+            local orig_idx="${binding_lookup["$BIND_MODS|$BIND_KEY"]:-}"
+            split_lua_keys "$LB_KEYS"
+            if [[ -n "$orig_idx" ]]; then
+                IFS='|' read -r _t _m _k _d _disp orig_args orig_file <<< "${EDIT_BINDINGS_ITEMS[$orig_idx]}"
+                EDIT_BINDINGS_ITEMS[$orig_idx]="bindd|$BIND_MODS|$BIND_KEY|$LB_DESC|lua|$orig_args|$orig_file"
+                BINDING_ORIG_KEYS[$orig_idx]="$pending_unbind"
+                pending_unbind=""
                 continue
             fi
-
-            # Process bindd lines
-            [[ "$line" =~ ^bindd[[:space:]]*= ]] || continue
-
-            local content="${line#bindd = }"
-            content="${content#bindd=}"
-            IFS=',' read -ra parts <<< "$content"
-            [[ ${#parts[@]} -lt 4 ]] && continue
-
-            local b_mods="${parts[0]## }"
-            b_mods="${b_mods%% }"
-            local b_key="${parts[1]## }"
-            b_key="${b_key%% }"
-            local b_desc="${parts[2]## }"
-            b_desc="${b_desc%% }"
-            local b_disp="${parts[3]## }"
-            b_disp="${b_disp%% }"
-            local b_args=""
-            if [[ ${#parts[@]} -gt 4 ]]; then
-                b_args="${parts[*]:4}"
-                b_args="${b_args## }"
-                b_args="${b_args%% }"
-            fi
-
-            # Check if this bindd matches a pending unbind (override)
-            local was_override=false
-            for u_lookup in "${!pending_unbinds[@]}"; do
-                local orig_idx="${binding_lookup[$u_lookup]}"
-                local orig_entry="${EDIT_BINDINGS_ITEMS[$orig_idx]}"
-                IFS='|' read -r _t _m _k orig_desc _rest <<< "$orig_entry"
-                if [[ "$orig_desc" == "$b_desc" ]]; then
-                    # Update the default entry with overridden mods/key
-                    IFS='|' read -r _t _m _k _d orig_disp orig_args orig_file <<< "$orig_entry"
-                    EDIT_BINDINGS_ITEMS[$orig_idx]="bindd|$b_mods|$b_key|$b_desc|$b_disp|$b_args|$orig_file"
-                    # Update lookup for chained overrides
-                    unset "binding_lookup[$u_lookup]"
-                    binding_lookup["$b_mods|$b_key"]=$orig_idx
-                    unset "pending_unbinds[$u_lookup]"
-                    was_override=true
-                    break
-                fi
-            done
-
-            if [[ "$was_override" == false ]]; then
-                user_entries+=("bindd|$b_mods|$b_key|$b_desc|$b_disp|$b_args|$BINDINGS_CONF")
-            fi
-        done < "$BINDINGS_CONF"
-
-        # Add non-override user bindings
-        if [[ ${#user_entries[@]} -gt 0 ]]; then
-            EDIT_BINDINGS_ITEMS+=("HEADER|User Bindings")
-            for entry in "${user_entries[@]}"; do
-                EDIT_BINDINGS_ITEMS+=("$entry")
-            done
+            pending_unbind=""
         fi
+
+        # Skip binds written by other a-la-carchy features (they have their own toggles)
+        $in_edits || user_entries+=("$LB_KEYS|$LB_DESC|$LB_ACTION")
+    done < <(awk '
+        /^-- >>> a-la-carchy / && $0 != "-- >>> a-la-carchy keybind-edits" { skip = 1; next }
+        /^-- <<< a-la-carchy / && $0 != "-- <<< a-la-carchy keybind-edits" { skip = 0; next }
+        !skip { print }
+    ' "$BINDINGS_LUA")
+
+    if [[ ${#user_entries[@]} -gt 0 ]]; then
+        EDIT_BINDINGS_ITEMS+=("HEADER|User Bindings")
+        local ue
+        for ue in "${user_entries[@]}"; do
+            local u_keys="${ue%%|*}" rest="${ue#*|}"
+            local u_desc="${rest%%|*}" u_action="${rest#*|}"
+            split_lua_keys "$u_keys"
+            BINDING_LUA_ACTIONS+=("$u_action")
+            EDIT_BINDINGS_ITEMS+=("bindd|$BIND_MODS|$BIND_KEY|$u_desc|lua|$(( ${#BINDING_LUA_ACTIONS[@]} - 1 ))|$BINDINGS_LUA")
+        done
     fi
 }
 
@@ -330,25 +471,140 @@ parse_hypr_item() {
     IFS='|' read -r HYPR_ID HYPR_LABEL HYPR_TYPE HYPR_SECTION HYPR_KEY HYPR_DEFAULT HYPR_FILE HYPR_DESC <<< "$1"
 }
 
+# User config file for a Hyprland settings target (looknfeel|input)
+hypr_settings_file() {
+    echo "$HYPR_DIR/$1.lua"
+}
+
+# Format a Lua table key, quoting keys that aren't valid identifiers (e.g. tap-to-click)
+hypr_lua_key() {
+    if [[ "$1" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+        echo "$1"
+    else
+        echo "[\"$1\"]"
+    fi
+}
+
+# Convert a setting value to a Lua literal based on its item type
+hypr_lua_value() {
+    local type="$1" val="$2"
+    case "$type" in
+        bool)
+            [[ "$val" =~ ^(true|yes|on|1)$ ]] && echo "true" || echo "false"
+            ;;
+        int*|float*)
+            echo "$val"
+            ;;
+        color)
+            # Gradients ("rgba(..) rgba(..) 45deg") become { colors = {...}, angle = N }
+            if [[ "$val" == *" "* ]]; then
+                local colors="" angle="" part
+                for part in $val; do
+                    if [[ "$part" =~ ^([0-9]+)deg$ ]]; then
+                        angle="${BASH_REMATCH[1]}"
+                    else
+                        [[ -n "$colors" ]] && colors+=", "
+                        colors+="\"$part\""
+                    fi
+                done
+                if [[ -n "$angle" ]]; then
+                    echo "{ colors = { $colors }, angle = $angle }"
+                else
+                    echo "{ colors = { $colors } }"
+                fi
+            else
+                echo "\"$val\""
+            fi
+            ;;
+        *)
+            [[ "$val" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] && echo "$val" || echo "\"$val\""
+            ;;
+    esac
+}
+
+# Convert a Lua literal from a managed block back to the display/config form
+hypr_lua_to_value() {
+    local v="$1"
+    if [[ "$v" == \{* ]]; then
+        local out="" rest="$v"
+        while [[ "$rest" =~ \"([^\"]*)\"(.*) ]]; do
+            [[ -n "$out" ]] && out+=" "
+            out+="${BASH_REMATCH[1]}"
+            rest="${BASH_REMATCH[2]}"
+        done
+        [[ "$v" =~ angle[[:space:]]*=[[:space:]]*([0-9]+) ]] && out+=" ${BASH_REMATCH[1]}deg"
+        echo "$out"
+    elif [[ "$v" =~ ^\"(.*)\"$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "$v"
+    fi
+}
+
+# Build an hl.config({...}) block from an assoc array of dotted path -> Lua literal
+build_hypr_lua_block() {
+    local -n _lua_vals="$1"
+    local out="hl.config({"$'\n'
+    local -a prev=() parts=()
+    local path n common i
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        IFS='.' read -ra parts <<< "$path"
+        n=$(( ${#parts[@]} - 1 ))
+
+        # Close tables not shared with this path, then open the new ones
+        common=0
+        while (( common < ${#prev[@]} && common < n )) && [[ "${prev[$common]}" == "${parts[$common]}" ]]; do
+            common=$((common + 1))
+        done
+        for (( i = ${#prev[@]}; i > common; i-- )); do
+            out+="$(printf '%*s' $((i * 2)) '')},"$'\n'
+        done
+        for (( i = common; i < n; i++ )); do
+            out+="$(printf '%*s' $(((i + 1) * 2)) '')$(hypr_lua_key "${parts[$i]}") = {"$'\n'
+        done
+
+        out+="$(printf '%*s' $(((n + 1) * 2)) '')$(hypr_lua_key "${parts[$n]}") = ${_lua_vals[$path]},"$'\n'
+        prev=("${parts[@]:0:n}")
+    done < <(printf '%s\n' "${!_lua_vals[@]}" | sort)
+    for (( i = ${#prev[@]}; i > 0; i-- )); do
+        out+="$(printf '%*s' $((i * 2)) '')},"$'\n'
+    done
+    out+="})"
+    printf '%s' "$out"
+}
+
 # Load current values from managed blocks in config files
 load_hypr_settings() {
     HYPR_CURRENT=()
     local marker_start="# === a-la-carchy hyprland settings ==="
     local marker_end="# === end a-la-carchy hyprland settings ==="
 
-    local config_files=("$LOOKNFEEL_CONF" "$INPUT_CONF")
+    # Lua keys use underscores; map them back to the item keys (tap_to_click -> tap-to-click)
+    local -A lua_key_map=()
+    local entry
+    for entry in "${HYPR_GENERAL_ITEMS[@]}" "${HYPR_DECORATION_ITEMS[@]}" "${HYPR_INPUT_ITEMS[@]}" "${HYPR_GESTURES_ITEMS[@]}"; do
+        parse_hypr_item "$entry"
+        local item_key="${HYPR_SECTION}.${HYPR_KEY}"
+        lua_key_map["${item_key//-/_}"]="$item_key"
+    done
+
+    local config_files=("$(hypr_settings_file looknfeel)" "$(hypr_settings_file input)")
     for conf in "${config_files[@]}"; do
         [[ -f "$conf" ]] || continue
+
+        local is_lua=false
+        [[ "$conf" == *.lua ]] && is_lua=true
 
         local in_block=false
         local section_stack=()
         while IFS= read -r line; do
-            if [[ "$line" == "$marker_start" ]]; then
+            if [[ "$line" == "$marker_start" || "$line" == "-- ${marker_start#\# }" ]]; then
                 in_block=true
                 section_stack=()
                 continue
             fi
-            if [[ "$line" == "$marker_end" ]]; then
+            if [[ "$line" == "$marker_end" || "$line" == "-- ${marker_end#\# }" ]]; then
                 in_block=false
                 continue
             fi
@@ -359,8 +615,26 @@ load_hypr_settings() {
             [[ -z "$trimmed" ]] && continue
             [[ "$trimmed" == \#* ]] && continue
 
-            # Opening brace: push section
-            if [[ "$trimmed" =~ ^([a-zA-Z_][a-zA-Z0-9_.-]*)[[:space:]]*\{$ ]]; then
+            if $is_lua; then
+                if [[ "$trimmed" =~ ^hl\.gesture\(\{\ fingers\ =\ ([0-9]+),.*action\ =\ \"workspace\" ]]; then
+                    HYPR_CURRENT["gestures.workspace_swipe"]="true"
+                    HYPR_CURRENT["gestures.workspace_swipe_fingers"]="${BASH_REMATCH[1]}"
+                    continue
+                fi
+                if [[ "$trimmed" =~ ^--\ workspace_swipe\ =\ false,\ workspace_swipe_fingers\ =\ ([0-9]+)$ ]]; then
+                    HYPR_CURRENT["gestures.workspace_swipe"]="false"
+                    HYPR_CURRENT["gestures.workspace_swipe_fingers"]="${BASH_REMATCH[1]}"
+                    continue
+                fi
+                [[ "$trimmed" == --* ]] && continue
+                [[ "$trimmed" == "hl.config({" || "$trimmed" == "})" ]] && continue
+                # Drop trailing comma and unquote ["key"] table keys
+                trimmed="${trimmed%,}"
+                [[ "$trimmed" =~ ^\[\"([^\"]+)\"\](.*)$ ]] && trimmed="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+            fi
+
+            # Opening brace: push section ("name {" or Lua "name = {")
+            if [[ "$trimmed" =~ ^([a-zA-Z_][a-zA-Z0-9_.-]*)[[:space:]]*=?[[:space:]]*\{$ ]]; then
                 section_stack+=("${BASH_REMATCH[1]}")
                 continue
             fi
@@ -379,6 +653,7 @@ load_hypr_settings() {
                 local v="${BASH_REMATCH[2]}"
                 # Trim trailing whitespace from value
                 v="${v%"${v##*[![:space:]]}"}"
+                $is_lua && v="$(hypr_lua_to_value "$v")"
 
                 # Build full section path
                 local section_path=""
@@ -388,6 +663,7 @@ load_hypr_settings() {
                 done
 
                 local full_key="${section_path}.${k}"
+                $is_lua && full_key="${lua_key_map[$full_key]:-$full_key}"
                 HYPR_CURRENT["$full_key"]="$v"
             fi
         done < "$conf"
@@ -800,87 +1076,66 @@ apply_hypr_edits() {
 
     echo
 
-    local marker_start="# === a-la-carchy hyprland settings ==="
-    local marker_end="# === end a-la-carchy hyprland settings ==="
+    local marker_start marker_end
 
     # Group edits by config file, then by section_path
     for target_file in "looknfeel" "input"; do
         local conf
-        [[ "$target_file" == "looknfeel" ]] && conf="$LOOKNFEEL_CONF"
-        [[ "$target_file" == "input" ]] && conf="$INPUT_CONF"
+        conf="$(hypr_settings_file "$target_file")"
 
-        # Collect edits for this file
+        # Collect this file's settings: saved values first, pending edits on top,
+        # since the managed block is rewritten as a whole on every apply
         local -A file_edits=()
+        local -A lua_vals=()
+        local -A edited_keys=()
         local has_edits=false
         for entry in "${all_items[@]}"; do
             parse_hypr_item "$entry"
             [[ "$HYPR_FILE" != "$target_file" ]] && continue
-            [[ -z "${HYPR_EDITS[$HYPR_ID]:-}" ]] && continue
-            file_edits["${HYPR_SECTION}.${HYPR_KEY}"]="${HYPR_EDITS[$HYPR_ID]}"
-            has_edits=true
+            local fk="${HYPR_SECTION}.${HYPR_KEY}"
+            local val="${HYPR_CURRENT[$fk]:-}"
+            if [[ -n "${HYPR_EDITS[$HYPR_ID]:-}" ]]; then
+                val="${HYPR_EDITS[$HYPR_ID]}"
+                edited_keys["$fk"]=1
+                has_edits=true
+            fi
+            [[ -z "$val" ]] && continue
+            file_edits["$fk"]="$val"
+            # Lua config keys use underscores (tap-to-click -> tap_to_click)
+            lua_vals["${fk//-/_}"]="$(hypr_lua_value "$HYPR_TYPE" "$val")"
         done
         $has_edits || continue
 
-        [[ ! -f "$conf" ]] && continue
+        if [[ ! -f "$conf" ]]; then
+            echo -e "  ${DIM}✗${RESET}  ${conf##*/} not found at $conf"
+            SUMMARY_LOG+=("✗  Hyprland: ${conf##*/} -- failed (config not found)")
+            continue
+        fi
 
         # Backup
         local backup_file="${conf}.backup.$(date +%Y%m%d_%H%M%S)"
         cp "$conf" "$backup_file"
         echo -e "  ${DIM}Backup: $backup_file${RESET}"
 
-        # Build managed block content with nested sections
-        local -A sections_content=()
-        for full_key in "${!file_edits[@]}"; do
-            local section="${full_key%.*}"
-            local key="${full_key##*.}"
-            local val="${file_edits[$full_key]}"
-            sections_content["$section"]+="    ${key} = ${val}"$'\n'
-        done
-
-        # Build the block with proper nesting
         local block=""
+        marker_start="-- === a-la-carchy hyprland settings ==="
+        marker_end="-- === end a-la-carchy hyprland settings ==="
         block+="$marker_start"$'\n'
-
-        # Sort sections and build nested structure
-        local -A top_sections=()
-        for section in "${!sections_content[@]}"; do
-            local top="${section%%.*}"
-            top_sections["$top"]=1
-        done
-
-        for top in "${!top_sections[@]}"; do
-            # Collect direct keys for this top section
-            local direct_content="${sections_content[$top]:-}"
-            # Collect sub-sections
-            local -A sub_sections=()
-            for section in "${!sections_content[@]}"; do
-                if [[ "$section" == "$top."* ]]; then
-                    local sub="${section#*.}"
-                    sub_sections["$sub"]="${sections_content[$section]}"
-                fi
-            done
-
-            block+="${top} {"$'\n'
-            if [[ -n "$direct_content" ]]; then
-                block+="$direct_content"
-            fi
-            for sub in "${!sub_sections[@]}"; do
-                block+="    ${sub} {"$'\n'
-                # Indent sub-section content further
-                local sub_content="${sub_sections[$sub]}"
-                while IFS= read -r sline; do
-                    [[ -z "$sline" ]] && continue
-                    block+="    ${sline}"$'\n'
-                done <<< "$sub_content"
-                block+="    }"$'\n'
-            done
-            block+="}"$'\n'
-        done
+        # Workspace swipe is a gesture binding in Lua configs, not a gestures option
+        local swipe="${lua_vals[gestures.workspace_swipe]:-}"
+        local swipe_fingers="${lua_vals[gestures.workspace_swipe_fingers]:-3}"
+        unset 'lua_vals[gestures.workspace_swipe]' 'lua_vals[gestures.workspace_swipe_fingers]'
+        [[ ${#lua_vals[@]} -gt 0 ]] && block+="$(build_hypr_lua_block lua_vals)"$'\n'
+        if [[ "$swipe" == "true" ]]; then
+            block+="hl.gesture({ fingers = ${swipe_fingers}, direction = \"horizontal\", action = \"workspace\" })"$'\n'
+        elif [[ "$swipe" == "false" ]]; then
+            block+="-- workspace_swipe = false, workspace_swipe_fingers = ${swipe_fingers}"$'\n'
+        fi
 
         block+="$marker_end"
 
         # Remove existing managed block if present, then append new one
-        if grep -q "$marker_start" "$conf"; then
+        if grep -qF -- "$marker_start" "$conf"; then
             # Use awk to remove the block
             awk -v start="$marker_start" -v end="$marker_end" '
                 $0 == start { skip=1; next }
@@ -894,8 +1149,8 @@ apply_hypr_edits() {
         echo "" >> "$conf"
         echo "$block" >> "$conf"
 
-        # Log each setting
-        for full_key in "${!file_edits[@]}"; do
+        # Log each changed setting
+        for full_key in "${!edited_keys[@]}"; do
             local key="${full_key##*.}"
             local val="${file_edits[$full_key]}"
             echo -e "    ${CHECKED}✓${RESET}  ${full_key} = ${val}"
@@ -904,11 +1159,15 @@ apply_hypr_edits() {
     done
 
     echo
-    echo -e "  ${DIM}Hyprland will auto-reload the config.${RESET}"
+    if hypr_reload_check; then
+        echo -e "  ${DIM}Hyprland reloaded the config.${RESET}"
+    else
+        SUMMARY_LOG+=("✗  Hyprland settings -- Hyprland reported config errors")
+    fi
     echo
 }
 
-# Apply all pending keybinding edits to bindings.conf
+# Apply all pending keybinding edits to bindings.lua
 apply_binding_edits() {
     if [[ ${#BINDING_EDITS[@]} -eq 0 ]]; then
         return
@@ -931,167 +1190,75 @@ apply_binding_edits() {
     echo
     echo
 
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
+    confirm_continue "Keybinding edits" || return 0
 
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Keybinding edits -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    if [[ ! -f "$BINDINGS_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  bindings.conf not found at $BINDINGS_CONF"
+    if [[ ! -f "$BINDINGS_LUA" ]]; then
+        echo -e "  ${DIM}✗${RESET}  bindings.lua not found at $BINDINGS_LUA"
         SUMMARY_LOG+=("✗  Keybinding edits -- failed (config not found)")
         return 1
     fi
 
-    # Create backup
-    local backup_file="${BINDINGS_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$BINDINGS_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
+    backup_file "$BINDINGS_LUA"
     echo
 
+    # Rebuild the keybind-edits block from every moved binding: the key it
+    # originally had (unbound) and the key it has now (rebound with its action)
+    local block="" idx
+    for idx in "${!EDIT_BINDINGS_ITEMS[@]}"; do
+        local entry="${EDIT_BINDINGS_ITEMS[$idx]}"
+        [[ "$entry" == HEADER* ]] && continue
+        IFS='|' read -r _type cur_mods cur_key desc dispatcher action_idx source <<< "$entry"
+
+        local cur_keys orig_keys new_keys
+        cur_keys="$(join_lua_keys "$cur_mods" "$cur_key")"
+        orig_keys="${BINDING_ORIG_KEYS[$idx]:-$cur_keys}"
+        new_keys="$cur_keys"
+        if [[ -n "${BINDING_EDITS[$idx]:-}" ]]; then
+            IFS='|' read -r new_mods new_key <<< "${BINDING_EDITS[$idx]}"
+            new_keys="$(join_lua_keys "$new_mods" "$new_key")"
+        fi
+        [[ "$new_keys" == "$orig_keys" ]] && continue
+
+        block+="hl.unbind(\"$orig_keys\")"$'\n'
+        block+="o.bind(\"$new_keys\", \"$desc\", ${BINDING_LUA_ACTIONS[$action_idx]})"$'\n'
+    done
+
+    if [[ -n "$block" ]]; then
+        lua_block_write "$BINDINGS_LUA" "keybind-edits" "${block%$'\n'}"
+    else
+        lua_block_remove "$BINDINGS_LUA" "keybind-edits"
+    fi
+
+    local ok=true
+    hypr_reload_check || ok=false
     for idx in "${!BINDING_EDITS[@]}"; do
         local entry="${EDIT_BINDINGS_ITEMS[$idx]}"
-        IFS='|' read -r _type orig_mods orig_key desc dispatcher args source <<< "$entry"
+        IFS='|' read -r _type orig_mods orig_key desc _rest <<< "$entry"
         IFS='|' read -r new_mods new_key <<< "${BINDING_EDITS[$idx]}"
-
-        # Append unbind + rebind to bindings.conf
-        echo "" >> "$BINDINGS_CONF"
-        echo "unbind = $orig_mods, $orig_key" >> "$BINDINGS_CONF"
-        if [[ -n "$args" ]]; then
-            echo "bindd = $new_mods, $new_key, $desc, $dispatcher,$args" >> "$BINDINGS_CONF"
+        if $ok; then
+            echo -e "    ${CHECKED}✓${RESET}  $desc: $orig_mods+$orig_key -> $new_mods+$new_key"
+            SUMMARY_LOG+=("✓  Rebound $desc: $new_mods+$new_key")
         else
-            echo "bindd = $new_mods, $new_key, $desc, $dispatcher," >> "$BINDINGS_CONF"
+            SUMMARY_LOG+=("✗  Rebind $desc -- Hyprland reported config errors")
         fi
-
-        echo -e "    ${CHECKED}✓${RESET}  $desc: $orig_mods+$orig_key -> $new_mods+$new_key"
-        SUMMARY_LOG+=("✓  Rebound $desc: $new_mods+$new_key")
     done
-    echo
-    echo -e "  ${DIM}Reload Hyprland or log out/in to apply.${RESET}"
     echo
 }
 
 # Function to rebind close window from SUPER+W to SUPER+Q
 rebind_close_window() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Rebind Close Window${RESET}"
-    echo
-    echo -e "  ${DIM}Changes SUPER+W (Omarchy default) to SUPER+Q for closing windows.${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$TILING_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  tiling-v2.conf not found at $TILING_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Rebind close window -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if already changed
-    if grep -q "SUPER, Q, Close window, killactive" "$TILING_CONF"; then
-        echo -e "  ${DIM}Already set to SUPER+Q. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Rebind close window -- already set")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Rebind close window -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${TILING_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$TILING_CONF" "$backup_file"
-    echo -e "    ${DIM}Backup saved: $backup_file${RESET}"
-
-    # Replace SUPER, W with SUPER, Q for killactive
-    sed -i 's/bindd = SUPER, W, Close window, killactive,/bindd = SUPER, Q, Close window, killactive,/' "$TILING_CONF"
-
-    echo -e "    ${CHECKED}✓${RESET}  Close window rebound to SUPER+Q"
-    SUMMARY_LOG+=("✓  Rebind close window to SUPER+Q")
-    echo
-    echo -e "  ${DIM}Reload Hyprland or log out/in to apply.${RESET}"
-    echo
-    echo
+    apply_lua_block "Rebind Close Window" \
+        "Changes SUPER+W (Omarchy default) to SUPER+Q for closing windows." \
+        "$BINDINGS_LUA" "close-window" "Rebind close window to SUPER+Q" \
+        'hl.unbind("SUPER + W")
+o.bind("SUPER + Q", "Close window", hl.dsp.window.close())'
 }
 
 # Function to restore close window to SUPER+W (Omarchy default)
 restore_close_window() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Restore Close Window${RESET}"
-    echo
-    echo -e "  ${DIM}Restores SUPER+W (Omarchy default) for closing windows.${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$TILING_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  tiling-v2.conf not found at $TILING_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Restore close window -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if already set to SUPER+W
-    if grep -q "SUPER, W, Close window, killactive" "$TILING_CONF"; then
-        echo -e "  ${DIM}Already set to SUPER+W. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Restore close window -- already set")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Restore close window -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${TILING_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$TILING_CONF" "$backup_file"
-    echo -e "    ${DIM}Backup saved: $backup_file${RESET}"
-
-    # Replace SUPER, Q with SUPER, W for killactive
-    sed -i 's/bindd = SUPER, Q, Close window, killactive,/bindd = SUPER, W, Close window, killactive,/' "$TILING_CONF"
-
-    echo -e "    ${CHECKED}✓${RESET}  Close window restored to SUPER+W"
-    SUMMARY_LOG+=("✓  Restore close window to SUPER+W")
-    echo
-    echo -e "  ${DIM}Reload Hyprland or log out/in to apply.${RESET}"
-    echo
-    echo
+    apply_lua_block "Restore Close Window" \
+        "Restores SUPER+W (Omarchy default) for closing windows." \
+        "$BINDINGS_LUA" "close-window" "Restore close window to SUPER+W"
 }
 
 # Function to backup config directories
@@ -1112,13 +1279,13 @@ backup_configs() {
     # Directories to back up (relative to ~/.config)
     local config_dirs=(
         "hypr"
-        "waybar"
-        "mako"
         "omarchy"
-        "walker"
+        "uwsm"
+        "fastfetch"
         "alacritty"
         "kitty"
         "ghostty"
+        "foot"
     )
 
     # Check which dirs exist
@@ -1239,141 +1406,55 @@ RESTORE_EOF
 }
 
 # Function to set monitor scaling to 4K
-set_monitor_4k() {
+# Set Omarchy's global scale variables at the top of monitors.lua. Per-monitor
+# hl.monitor rules keep their own scale, so explicit layouts are left alone.
+set_monitor_scale() {
+    local label="$1" gdk_scale="$2" monitor_scale="$3"
+
     clear
     echo
     echo
-    echo -e "${BOLD}  Set Monitor Scaling: 4K${RESET}"
+    echo -e "${BOLD}  Set Monitor Scaling: $label${RESET}"
     echo
-    echo -e "  ${DIM}Configures monitor scaling optimized for 4K displays.${RESET}"
-    echo -e "  ${DIM}Sets GDK_SCALE=1.75 and monitor scale to 1.666667.${RESET}"
+    echo -e "  ${DIM}Sets GDK_SCALE=$gdk_scale and the default monitor scale to $monitor_scale.${RESET}"
+    echo -e "  ${DIM}Monitors with their own rule in monitors.lua keep their scale.${RESET}"
     echo
     echo
 
-    if [[ ! -f "$MONITORS_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  monitors.conf not found at $MONITORS_CONF"
+    if [[ ! -f "$MONITORS_LUA" ]] || ! grep -q "^local omarchy_gdk_scale = " "$MONITORS_LUA"; then
+        echo -e "  ${DIM}✗${RESET}  Omarchy scale settings not found in $MONITORS_LUA"
+        echo -e "  ${DIM}    Run 'omarchy refresh config hypr/monitors.lua' to restore them.${RESET}"
         echo
-        SUMMARY_LOG+=("✗  Monitor scaling 4K -- failed (config not found)")
+        SUMMARY_LOG+=("✗  Monitor scaling $label -- failed (config not found)")
         return 1
     fi
 
-    if grep -q "^monitor=[A-Za-z]" "$MONITORS_CONF" 2>/dev/null; then
-        echo -e "  ${DIM}Note: Per-monitor layout detected. This will replace it with generic scaling.${RESET}"
-        echo
+    confirm_continue "Monitor scaling $label" || return 0
+
+    backup_file "$MONITORS_LUA"
+    sed -i \
+        -e "s/^local omarchy_gdk_scale = .*/local omarchy_gdk_scale = $gdk_scale/" \
+        -e "s/^local omarchy_monitor_scale = .*/local omarchy_monitor_scale = $monitor_scale/" \
+        "$MONITORS_LUA"
+
+    if hypr_reload_check; then
+        echo -e "    ${CHECKED}✓${RESET}  Monitor scaling set to $label"
+        SUMMARY_LOG+=("✓  Monitor scaling set to $label")
+    else
+        SUMMARY_LOG+=("✗  Monitor scaling $label -- Hyprland reported config errors")
     fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Monitor scaling 4K -- cancelled")
-        return 0
-    fi
-
     echo
-
-    # Create backup
-    local backup_file="${MONITORS_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$MONITORS_CONF" "$backup_file"
-    echo -e "    ${DIM}Backup saved: $backup_file${RESET}"
-
-    # Preserve managed blocks before overwriting
-    save_managed_blocks
-
-    # Write new config
-    cat > "$MONITORS_CONF" << 'EOF'
-# See https://wiki.hyprland.org/Configuring/Monitors/
-# List current monitors and resolutions possible: hyprctl monitors
-# Format: monitor = [port], resolution, position, scale
-
-# Optimized for 27" or 32" 4K monitors
-env = GDK_SCALE,1.75
-monitor=,preferred,auto,1.666667
-EOF
-
-    # Restore managed blocks (power-profile, laptop-auto-off, etc.)
-    restore_managed_blocks
-
-    echo -e "    ${CHECKED}✓${RESET}  Monitor scaling set to 4K"
-    SUMMARY_LOG+=("✓  Monitor scaling set to 4K")
+    echo -e "  ${DIM}GDK_SCALE applies to apps started after the next login.${RESET}"
     echo
-    echo -e "  ${DIM}Hyprland will auto-reload the config.${RESET}"
-    echo
-    echo
+}
+
+set_monitor_4k() {
+    set_monitor_scale "4K" "1.75" "1.666667"
 }
 
 # Function to set monitor scaling to 1080p/1440p
 set_monitor_1080_1440() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Set Monitor Scaling: 1080p / 1440p${RESET}"
-    echo
-    echo -e "  ${DIM}Configures monitor scaling for 1080p or 1440p displays.${RESET}"
-    echo -e "  ${DIM}Sets GDK_SCALE=1 and monitor scale to 1 (no scaling).${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$MONITORS_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  monitors.conf not found at $MONITORS_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Monitor scaling 1080p/1440p -- failed (config not found)")
-        return 1
-    fi
-
-    if grep -q "^monitor=[A-Za-z]" "$MONITORS_CONF" 2>/dev/null; then
-        echo -e "  ${DIM}Note: Per-monitor layout detected. This will replace it with generic scaling.${RESET}"
-        echo
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Monitor scaling 1080p/1440p -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${MONITORS_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$MONITORS_CONF" "$backup_file"
-    echo -e "    ${DIM}Backup saved: $backup_file${RESET}"
-
-    # Preserve managed blocks before overwriting
-    save_managed_blocks
-
-    # Write new config
-    cat > "$MONITORS_CONF" << 'EOF'
-# See https://wiki.hyprland.org/Configuring/Monitors/
-# List current monitors and resolutions possible: hyprctl monitors
-# Format: monitor = [port], resolution, position, scale
-
-# Straight 1x setup for 1080p or 1440p displays
-env = GDK_SCALE,1
-monitor=,preferred,auto,1
-EOF
-
-    # Restore managed blocks (power-profile, laptop-auto-off, etc.)
-    restore_managed_blocks
-
-    echo -e "    ${CHECKED}✓${RESET}  Monitor scaling set to 1080p/1440p"
-    SUMMARY_LOG+=("✓  Monitor scaling set to 1080p/1440p")
-    echo
-    echo -e "  ${DIM}Hyprland will auto-reload the config.${RESET}"
-    echo
-    echo
+    set_monitor_scale "1080p/1440p" "1" "1"
 }
 
 # Detect connected monitors via hyprctl
@@ -1382,54 +1463,28 @@ detect_monitors() {
     MONITOR_COUNT=0
     LAPTOP_MONITOR=""
 
-    if ! command -v hyprctl &>/dev/null; then
-        return 1
-    fi
+    command -v hyprctl &>/dev/null || return 1
+    command -v jq &>/dev/null || return 1
 
-    local output
-    output=$(hyprctl monitors 2>/dev/null) || return 1
+    local json
+    json=$(hyprctl monitors -j 2>/dev/null) || return 1
 
-    local name="" make="" model="" width="" height="" pos_x="" pos_y="" scale="" desc="" transform=""
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^Monitor\ ([^ ]+) ]]; then
-            # Save previous monitor if any
-            if [[ -n "$name" ]]; then
-                DETECTED_MONITORS+=("${name}|${make}|${model}|${width}|${height}|${pos_x}|${pos_y}|${scale}|${desc}|${transform}")
-                ((MONITOR_COUNT++))
-                if [[ "$name" == eDP-* ]]; then
-                    LAPTOP_MONITOR="$name"
-                fi
-            fi
-            name="${BASH_REMATCH[1]}"
-            make="" model="" width="" height="" pos_x="" pos_y="" scale="" desc="" transform="0"
-        elif [[ "$line" =~ ([0-9]+)x([0-9]+)@.*\ at\ (-?[0-9]+)x(-?[0-9]+) ]]; then
-            width="${BASH_REMATCH[1]}"
-            height="${BASH_REMATCH[2]}"
-            pos_x="${BASH_REMATCH[3]}"
-            pos_y="${BASH_REMATCH[4]}"
-        elif [[ "$line" =~ scale:\ ([0-9.]+) ]]; then
-            scale="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ transform:\ ([0-9]+) ]]; then
-            transform="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ description:\ (.+) ]]; then
-            desc="${BASH_REMATCH[1]}"
-            # Parse make/model from description (format: "Make Model (name)")
-            local desc_clean="${BASH_REMATCH[1]}"
-            desc_clean="${desc_clean% (*}"
-            make="${desc_clean%% *}"
-            model="${desc_clean#* }"
-            [[ "$make" == "$model" ]] && model=""
-        fi
-    done <<< "$output"
-
-    # Save last monitor
-    if [[ -n "$name" ]]; then
-        DETECTED_MONITORS+=("${name}|${make}|${model}|${width}|${height}|${pos_x}|${pos_y}|${scale}|${desc}|${transform}")
-        ((MONITOR_COUNT++))
-        if [[ "$name" == eDP-* ]]; then
-            LAPTOP_MONITOR="$name"
-        fi
-    fi
+    # Entry: name|make|model|width|height|x|y|scale|desc|transform|mode|vrr|bitdepth
+    # mode/vrr/bitdepth are carried over so layout changes keep refresh rate,
+    # VRR and 10-bit color exactly as they are now.
+    local entry
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        DETECTED_MONITORS+=("$entry")
+        MONITOR_COUNT=$((MONITOR_COUNT + 1))
+        [[ "${entry%%|*}" == eDP-* ]] && LAPTOP_MONITOR="${entry%%|*}"
+    done < <(jq -r '.[] | [
+        .name, (.make // ""), (.model // ""), .width, .height, .x, .y, .scale,
+        .description, .transform,
+        "\(.width)x\(.height)@\(.refreshRate * 100 | round / 100)",
+        (if .vrr then 1 else 0 end),
+        (if (.currentFormat // "" | test("2101010")) then 10 else 8 end)
+    ] | map(tostring | gsub("\\|"; "/")) | join("|")' <<< "$json")
 
     return 0
 }
@@ -1465,7 +1520,7 @@ show_monitor_detection_dialog() {
     local -a transform_labels=("Normal" "90°" "180°" "270°" "Flipped" "Flipped 90°" "Flipped 180°" "Flipped 270°")
     for entry in "${DETECTED_MONITORS[@]}"; do
         ((i++))
-        IFS='|' read -r m_name m_make m_model m_w m_h m_x m_y m_scale m_desc m_transform <<< "$entry"
+        IFS='|' read -r m_name m_make m_model m_w m_h m_x m_y m_scale m_desc m_transform _extra <<< "$entry"
         local label=""
         [[ "$m_name" == eDP-* ]] && label=" (laptop)"
         local rot_label="${transform_labels[${m_transform:-0}]}"
@@ -1496,7 +1551,7 @@ identify_monitors() {
     for entry in "${DETECTED_MONITORS[@]}"; do
         ((i++))
         IFS='|' read -r m_name _rest <<< "$entry"
-        hyprctl dispatch focusmonitor "$m_name" &>/dev/null
+        hyprctl dispatch "hl.dsp.focus({ monitor = \"$m_name\" })" &>/dev/null
         hyprctl notify 1 2000 "rgb(33ccff)" "fontsize:28 Monitor $i: $m_name" &>/dev/null
         sleep 2
     done
@@ -1538,7 +1593,7 @@ show_position_editor_dialog() {
     # Build arrays of monitor names, widths, heights, scales, transforms
     local -a mon_names=() mon_widths=() mon_heights=() mon_scales=() mon_transforms=()
     for entry in "${DETECTED_MONITORS[@]}"; do
-        IFS='|' read -r m_name m_make m_model m_w m_h m_x m_y m_scale m_desc m_transform <<< "$entry"
+        IFS='|' read -r m_name m_make m_model m_w m_h m_x m_y m_scale m_desc m_transform _extra <<< "$entry"
         mon_names+=("$m_name")
         mon_widths+=("$m_w")
         mon_heights+=("$m_h")
@@ -1874,7 +1929,7 @@ show_position_editor_dialog() {
     read -rsn1 < /dev/tty
 }
 
-# Apply monitor positions to monitors.conf
+# Apply monitor positions to monitors.lua
 apply_monitor_positions() {
     clear
     echo
@@ -1882,78 +1937,46 @@ apply_monitor_positions() {
     echo -e "${BOLD}  Apply Monitor Positions${RESET}"
     echo
 
-    if [[ ! -f "$MONITORS_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  monitors.conf not found at $MONITORS_CONF"
+    if [[ ! -f "$MONITORS_LUA" ]]; then
+        echo -e "  ${DIM}✗${RESET}  monitors.lua not found at $MONITORS_LUA"
         echo
         SUMMARY_LOG+=("✗  Monitor positions -- failed (config not found)")
         return 1
     fi
 
     echo
+    backup_file "$MONITORS_LUA"
 
-    # Create backup
-    local backup_file="${MONITORS_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$MONITORS_CONF" "$backup_file"
-    echo -e "    ${DIM}Backup saved: $backup_file${RESET}"
-
-    # Determine GDK_SCALE: use 1.75 if any monitor has scale > 1.5
-    local gdk_scale=1
+    # One rule per monitor, matched by description so it survives port changes.
+    # Mode, VRR and bit depth come from the live state, so the layout block never
+    # resets refresh rate, VRR or 10-bit color.
+    local block="" entry
     for entry in "${DETECTED_MONITORS[@]}"; do
-        IFS='|' read -r _n _mk _mo _w _h _x _y m_scale _d <<< "$entry"
-        if awk "BEGIN { exit !($m_scale > 1.5) }"; then
-            gdk_scale="1.75"
-            break
-        fi
-    done
-
-    # Apply positions and transforms live via hyprctl keyword
-    for entry in "${DETECTED_MONITORS[@]}"; do
-        IFS='|' read -r m_name _mk _mo _w _h _x _y m_scale _d _t <<< "$entry"
+        IFS='|' read -r m_name _mk _mo _w _h _x _y m_scale m_desc _t m_mode m_vrr m_bitdepth <<< "$entry"
         local pos="${MONITOR_POSITIONS[$m_name]:-auto}"
         local transform="${MONITOR_TRANSFORMS[$m_name]:-0}"
-        if [[ "$pos" != "auto" ]]; then
-            local px="${pos%,*}"
-            local py="${pos#*,}"
-            hyprctl keyword monitor "${m_name},preferred,${px}x${py},${m_scale},transform,${transform}" &>/dev/null
-        else
-            hyprctl keyword monitor "${m_name},preferred,auto,${m_scale},transform,${transform}" &>/dev/null
-        fi
+        [[ "$pos" != "auto" ]] && pos="${pos%,*}x${pos#*,}"
+
+        local output="$m_name"
+        [[ -n "$m_desc" ]] && output="desc:${m_desc//\"/\\\"}"
+
+        local rule="hl.monitor({ output = \"$output\", mode = \"${m_mode:-preferred}\", position = \"$pos\", scale = $m_scale, transform = $transform"
+        [[ -n "$m_vrr" ]] && rule+=", vrr = $m_vrr"
+        [[ "$m_bitdepth" == "10" ]] && rule+=", bitdepth = 10"
+        rule+=" })"
+        block+="$rule"$'\n'
     done
-    echo -e "    ${CHECKED}✓${RESET}  Monitor layout applied live"
+    block="${block%$'\n'}"
 
-    # Preserve managed blocks before overwriting
-    save_managed_blocks
+    lua_block_write "$MONITORS_LUA" "monitor-layout" "$block"
+    echo -e "    ${CHECKED}✓${RESET}  Layout saved to monitors.lua"
 
-    # Save to config file for persistence
-    {
-        echo "# See https://wiki.hyprland.org/Configuring/Monitors/"
-        echo "# Configured by A La Carchy - multi-monitor layout"
-        echo "# Format: monitor = name, resolution, position, scale"
-        echo ""
-        echo "env = GDK_SCALE,$gdk_scale"
-        echo ""
-        for entry in "${DETECTED_MONITORS[@]}"; do
-            IFS='|' read -r m_name _mk _mo _w _h _x _y m_scale _d _t <<< "$entry"
-            local pos="${MONITOR_POSITIONS[$m_name]:-auto}"
-            local transform="${MONITOR_TRANSFORMS[$m_name]:-0}"
-            if [[ "$pos" != "auto" ]]; then
-                local px="${pos%,*}"
-                local py="${pos#*,}"
-                echo "monitor=${m_name},preferred,${px}x${py},${m_scale},transform,${transform}"
-            else
-                echo "monitor=${m_name},preferred,auto,${m_scale},transform,${transform}"
-            fi
-        done
-        echo ""
-        echo "# Fallback for hot-plugged displays"
-        echo "monitor=,preferred,auto,1"
-    } > "$MONITORS_CONF"
-
-    # Restore managed blocks (power-profile, laptop-auto-off, etc.)
-    restore_managed_blocks
-
-    echo -e "    ${CHECKED}✓${RESET}  Config saved to monitors.conf"
-    SUMMARY_LOG+=("✓  Monitor layout configured")
+    if hypr_reload_check; then
+        echo -e "    ${CHECKED}✓${RESET}  Monitor layout applied"
+        SUMMARY_LOG+=("✓  Monitor layout configured")
+    else
+        SUMMARY_LOG+=("✗  Monitor layout -- Hyprland reported config errors")
+    fi
     echo
     echo
 }
@@ -2036,13 +2059,13 @@ handle_change() {
             SAVED_BRIGHTNESS=\$(brightnessctl -d "\$BACKLIGHT" g 2>/dev/null)
             [[ -z "\$SAVED_BRIGHTNESS" || "\$SAVED_BRIGHTNESS" == "0" ]] && SAVED_BRIGHTNESS=\$DEFAULT_BRIGHTNESS
         fi
-        hyprctl keyword monitor "\$LAPTOP, disable" &>/dev/null
+        hyprctl eval "hl.monitor({ output = \"\$LAPTOP\", disabled = true })" &>/dev/null
         brightnessctl -d "\$BACKLIGHT" s 0 &>/dev/null
         # Move workspace 1 to the remaining external monitor
         local ext_mon
         ext_mon=\$(hyprctl monitors -j | grep -oP '"name":\s*"\K[^"]+' | grep -v "^eDP" | head -1)
         if [[ -n "\$ext_mon" ]]; then
-            hyprctl dispatch moveworkspacetomonitor 1 "\$ext_mon" &>/dev/null
+            hyprctl dispatch "hl.dsp.workspace.move({ workspace = \"1\", monitor = \"\$ext_mon\" })" &>/dev/null
         fi
     else
         # Skip if laptop is already the only display
@@ -2050,7 +2073,7 @@ handle_change() {
 
         # No external display - restore laptop
         brightnessctl -d "\$BACKLIGHT" s "\${SAVED_BRIGHTNESS:-\$DEFAULT_BRIGHTNESS}" &>/dev/null
-        hyprctl keyword monitor "\$LAPTOP, preferred, auto, 1" &>/dev/null
+        hyprctl eval "hl.monitor({ output = \"\$LAPTOP\", mode = \"preferred\", position = \"auto\", scale = 1 })" &>/dev/null
     fi
 }
 
@@ -2081,20 +2104,11 @@ SCRIPTEOF
     chmod +x "$LAPTOP_AUTO_SCRIPT"
     echo -e "    ${CHECKED}✓${RESET}  Watcher script created: $LAPTOP_AUTO_SCRIPT"
 
-    # Add exec-once to monitors.conf using managed block
-    if ! grep -q "$LAPTOP_AUTO_MARKER_START" "$MONITORS_CONF" 2>/dev/null; then
-        {
-            echo ""
-            echo "$LAPTOP_AUTO_MARKER_START"
-            echo "exec-once = $LAPTOP_AUTO_SCRIPT"
-            echo "$LAPTOP_AUTO_MARKER_END"
-        } >> "$MONITORS_CONF"
-        echo -e "    ${CHECKED}✓${RESET}  Added exec-once to monitors.conf"
-    else
-        echo -e "    ${DIM}exec-once already present in monitors.conf${RESET}"
-    fi
+    # Start the watcher with Hyprland
+    lua_block_write "$AUTOSTART_LUA" "laptop-display" "$(lua_on_start "$LAPTOP_AUTO_SCRIPT")"
+    echo -e "    ${CHECKED}✓${RESET}  Added startup entry to autostart.lua"
 
-    # Start the script now (exec-once only runs at Hyprland startup)
+    # Start the script now (startup entries only run when Hyprland starts)
     pkill -f "laptop-display-auto.sh" 2>/dev/null
     nohup "$LAPTOP_AUTO_SCRIPT" &>/dev/null &
     echo -e "    ${CHECKED}✓${RESET}  Watcher started"
@@ -2112,12 +2126,9 @@ remove_laptop_auto_off() {
     echo -e "${BOLD}  Disable Laptop Display Auto-Off${RESET}"
     echo
 
-    # Remove managed block from monitors.conf
-    if [[ -f "$MONITORS_CONF" ]] && grep -q "$LAPTOP_AUTO_MARKER_START" "$MONITORS_CONF" 2>/dev/null; then
-        sed -i "/$LAPTOP_AUTO_MARKER_START/,/$LAPTOP_AUTO_MARKER_END/d" "$MONITORS_CONF"
-        # Remove trailing blank lines
-        sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$MONITORS_CONF"
-        echo -e "    ${CHECKED}✓${RESET}  Removed exec-once from monitors.conf"
+    if lua_block_has "$AUTOSTART_LUA" "laptop-display"; then
+        lua_block_remove "$AUTOSTART_LUA" "laptop-display"
+        echo -e "    ${CHECKED}✓${RESET}  Removed startup entry from autostart.lua"
     fi
 
     # Remove script
@@ -2143,7 +2154,7 @@ remove_laptop_auto_off() {
         detect_monitors
     fi
     if [[ -n "$LAPTOP_MONITOR" ]]; then
-        hyprctl keyword monitor "$LAPTOP_MONITOR, preferred, auto, 1" &>/dev/null
+        hyprctl eval "hl.monitor({ output = \"$LAPTOP_MONITOR\", mode = \"preferred\", position = \"auto\", scale = 1 })" &>/dev/null
         echo -e "    ${CHECKED}✓${RESET}  Re-enabled $LAPTOP_MONITOR"
     fi
 
@@ -2173,12 +2184,18 @@ show_primary_monitor_dialog() {
         return
     fi
 
-    # Check if a primary monitor is already configured in monitors.conf
-    local configured_primary=""
-    if [[ -f "$MONITORS_CONF" ]] && grep -q "$PRIMARY_MONITOR_MARKER_START" "$MONITORS_CONF" 2>/dev/null; then
-        configured_primary=$(awk -v s="$PRIMARY_MONITOR_MARKER_START" -v e="$PRIMARY_MONITOR_MARKER_END" \
-            '$0==s{f=1;next} $0==e{f=0} f && /workspace = 1,/' "$MONITORS_CONF" | \
-            grep -oP 'monitor:\K[^,]+')
+    # Check if a primary monitor is already configured in monitors.lua
+    local configured_primary="" configured_selector=""
+    configured_selector=$(lua_block_get "$MONITORS_LUA" "primary-monitor" | \
+        grep -oP 'workspace = "1", monitor = "\K[^"]+')
+    if [[ -n "$configured_selector" ]]; then
+        local pm_entry
+        for pm_entry in "${DETECTED_MONITORS[@]}"; do
+            IFS='|' read -r pm_name _ _ _ _ _ _ _ pm_desc _ <<< "$pm_entry"
+            if [[ "$configured_selector" == "$pm_name" || "$configured_selector" == "desc:$pm_desc" ]]; then
+                configured_primary="$pm_name"
+            fi
+        done
     fi
 
     local opt_cursor=0
@@ -2200,7 +2217,7 @@ show_primary_monitor_dialog() {
             label+=" (${m_width}x${m_height})"
             [[ "$m_name" == eDP-* ]] && label+=" [laptop]"
             local suffix=""
-            [[ "$m_name" == "$configured_primary" ]] && suffix=" (current)"
+            [[ -n "$configured_primary" && "$m_name" == "$configured_primary" ]] && suffix=" (current)"
             if [[ $i -eq $opt_cursor ]]; then
                 echo -e "    ${SELECTED_BG}> ${label}${suffix}${RESET}"
             else
@@ -2256,59 +2273,43 @@ apply_primary_monitor() {
         detect_monitors 2>/dev/null
     fi
 
-    # Apply live: move workspace 1 to selected monitor
-    if hyprctl dispatch moveworkspacetomonitor 1 "$SELECTED_PRIMARY_MONITOR" &>/dev/null; then
-        hyprctl dispatch workspace 1 &>/dev/null
-        echo -e "    ${CHECKED}✓${RESET}  Workspace 1 moved to $SELECTED_PRIMARY_MONITOR"
-    else
-        echo -e "    ${DIM}✗${RESET}  Failed to move workspace"
+    if [[ ! -f "$MONITORS_LUA" ]]; then
+        echo -e "    ${DIM}✗${RESET}  monitors.lua not found at $MONITORS_LUA"
+        SUMMARY_LOG+=("✗  Primary monitor -- failed (config not found)")
+        return 1
     fi
 
-    # Apply live: assign default workspaces to non-primary monitors
-    local ws=2
+    # Workspace 1 goes to the primary monitor, 2.. to the others in order.
+    # Rules match by description so they follow the monitor across ports.
+    local block="" ws=1 entry
+    local -a order=()
     for entry in "${DETECTED_MONITORS[@]}"; do
         IFS='|' read -r m_name _ <<< "$entry"
-        if [[ "$m_name" != "$SELECTED_PRIMARY_MONITOR" ]]; then
-            if hyprctl dispatch moveworkspacetomonitor "$ws" "$m_name" &>/dev/null; then
-                echo -e "    ${CHECKED}✓${RESET}  Workspace $ws moved to $m_name"
-            fi
-            ((ws++))
-        fi
+        [[ "$m_name" == "$SELECTED_PRIMARY_MONITOR" ]] && order=("$entry" "${order[@]}") || order+=("$entry")
     done
+    for entry in "${order[@]}"; do
+        IFS='|' read -r m_name _ _ _ _ _ _ _ m_desc _ <<< "$entry"
+        local selector="$m_name"
+        [[ -n "$m_desc" ]] && selector="desc:${m_desc//\"/\\\"}"
+        block+="hl.workspace_rule({ workspace = \"$ws\", monitor = \"$selector\", default = true })"$'\n'
 
-    # Write managed block to monitors.conf
-    if grep -q "$PRIMARY_MONITOR_MARKER_START" "$MONITORS_CONF" 2>/dev/null; then
-        sed -i "/$PRIMARY_MONITOR_MARKER_START/,/$PRIMARY_MONITOR_MARKER_END/d" "$MONITORS_CONF"
-        # Remove trailing blank lines
-        sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$MONITORS_CONF"
+        # Apply live
+        if hyprctl dispatch "hl.dsp.workspace.move({ workspace = \"$ws\", monitor = \"$m_name\" })" &>/dev/null; then
+            echo -e "    ${CHECKED}✓${RESET}  Workspace $ws moved to $m_name"
+        fi
+        ws=$((ws + 1))
+    done
+    hyprctl dispatch 'hl.dsp.focus({ workspace = "1" })' &>/dev/null
+
+    backup_file "$MONITORS_LUA"
+    lua_block_write "$MONITORS_LUA" "primary-monitor" "${block%$'\n'}"
+    echo -e "    ${CHECKED}✓${RESET}  Workspace rules written to monitors.lua"
+
+    if hypr_reload_check; then
+        SUMMARY_LOG+=("✓  Primary monitor set to $SELECTED_PRIMARY_MONITOR")
+    else
+        SUMMARY_LOG+=("✗  Primary monitor -- Hyprland reported config errors")
     fi
-
-    {
-        echo ""
-        echo "$PRIMARY_MONITOR_MARKER_START"
-        echo "workspace = 1, monitor:$SELECTED_PRIMARY_MONITOR, default:true"
-        # Assign incrementing workspaces to non-primary monitors
-        local ws=2
-        for entry in "${DETECTED_MONITORS[@]}"; do
-            IFS='|' read -r m_name _ <<< "$entry"
-            if [[ "$m_name" != "$SELECTED_PRIMARY_MONITOR" ]]; then
-                echo "workspace = $ws, monitor:$m_name, default:true"
-                ((ws++))
-            fi
-        done
-        echo "$PRIMARY_MONITOR_MARKER_END"
-    } >> "$MONITORS_CONF"
-    echo -e "    ${CHECKED}✓${RESET}  Workspace rules written to monitors.conf"
-
-    # Restart wallpaper daemon to fix layer positioning after workspace moves
-    if pgrep -x swaybg &>/dev/null; then
-        pkill swaybg
-        sleep 0.3
-        swaybg -i "$HOME/.config/omarchy/current/background" -m fill &>/dev/null & disown
-        echo -e "    ${CHECKED}✓${RESET}  Wallpaper reloaded"
-    fi
-
-    SUMMARY_LOG+=("✓  Primary monitor set to $SELECTED_PRIMARY_MONITOR")
     echo
     echo
 }
@@ -2435,20 +2436,8 @@ SCRIPTEOF
     chmod +x "$POWER_PROFILE_SCRIPT"
     echo -e "    ${CHECKED}✓${RESET}  Startup script created: $POWER_PROFILE_SCRIPT"
 
-    # Add/replace managed block in monitors.conf
-    if grep -q "$POWER_PROFILE_MARKER_START" "$MONITORS_CONF" 2>/dev/null; then
-        sed -i "/$POWER_PROFILE_MARKER_START/,/$POWER_PROFILE_MARKER_END/d" "$MONITORS_CONF"
-        # Remove trailing blank lines
-        sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$MONITORS_CONF"
-    fi
-
-    {
-        echo ""
-        echo "$POWER_PROFILE_MARKER_START"
-        echo "exec-once = $POWER_PROFILE_SCRIPT"
-        echo "$POWER_PROFILE_MARKER_END"
-    } >> "$MONITORS_CONF"
-    echo -e "    ${CHECKED}✓${RESET}  Added exec-once to monitors.conf"
+    lua_block_write "$AUTOSTART_LUA" "power-profile" "$(lua_on_start "$POWER_PROFILE_SCRIPT")"
+    echo -e "    ${CHECKED}✓${RESET}  Added startup entry to autostart.lua"
 
     # Sync asusd platform profile if asusd is present (prevents it overriding powerprofilesctl)
     local asusd_config="/etc/asusd/asusd.ron"
@@ -2921,20 +2910,9 @@ apply_battery_limit() {
             echo -e "    ${CHECKED}✓${RESET}  Removed battery limit helper script"
         fi
 
-        # Remove power menu override managed block
-        local ext_file="$HOME/.config/omarchy/extensions/menu.sh"
-        if [[ -f "$ext_file" ]] && grep -q "$POWER_MENU_MARKER_START" "$ext_file"; then
-            awk -v start="$POWER_MENU_MARKER_START" -v end="$POWER_MENU_MARKER_END" '
-                $0 == start { skip=1; next }
-                $0 == end   { skip=0; next }
-                !skip
-            ' "$ext_file" > "${ext_file}.tmp" && mv "${ext_file}.tmp" "$ext_file"
-
-            # Delete file if empty
-            if [[ ! -s "$ext_file" ]]; then
-                rm -f "$ext_file"
-            fi
-            echo -e "    ${CHECKED}✓${RESET}  Removed power menu charge limit override"
+        # Remove the Omarchy menu charge-limit picker
+        if remove_power_menu_override; then
+            echo -e "    ${CHECKED}✓${RESET}  Removed charge limit picker from the Omarchy menu"
         fi
     else
         # Write udev rule for persistence
@@ -2947,60 +2925,7 @@ apply_battery_limit() {
     sudo udevadm control --reload-rules 2>/dev/null
     echo -e "    ${CHECKED}✓${RESET}  Udev rules reloaded"
 
-    # Update waybar battery tooltip and format-plugged to show charge limit
-    if [[ -f "$WAYBAR_CONF" ]]; then
-        # Read format-full icon to reuse for format-plugged when limit is active
-        local bat_full_icon
-        bat_full_icon=$(sed -n 's/.*"format-full": "\([^"]*\)".*/\1/p' "$WAYBAR_CONF" | head -1)
-
-        # Save original format-plugged value before first modification
-        # (stored as a comment in the battery section for later restore)
-        if ! grep -q 'a-la-carchy-original-plugged' "$WAYBAR_CONF"; then
-            local orig_plugged
-            orig_plugged=$(sed -n 's/.*"format-plugged": "\([^"]*\)".*/\1/p' "$WAYBAR_CONF" | head -1)
-            sed -i "s|\"format-plugged\":|\\/\\/ a-la-carchy-original-plugged: \"${orig_plugged}\"\n    \"format-plugged\":|" "$WAYBAR_CONF"
-        fi
-
-        # Strip any existing limit annotations from tooltips
-        sed -i 's/ (limit: [0-9]*%)//g' "$WAYBAR_CONF"
-        # Remove tooltip-format-full if added by us (value is "Full" after stripping limit)
-        sed -i '/"tooltip-format-full": "Full"/d' "$WAYBAR_CONF"
-        # Remove tooltip-format-plugged (always managed by us)
-        sed -i '/"tooltip-format-plugged":/d' "$WAYBAR_CONF"
-
-        if [[ "$SELECTED_BATTERY_LIMIT" != "100" ]]; then
-            # Append limit to discharging/charging tooltips
-            sed -i "s/\(\"tooltip-format-discharging\": \"[^\"]*\)\"/\1 (limit: ${SELECTED_BATTERY_LIMIT}%)\"/" "$WAYBAR_CONF"
-            sed -i "s/\(\"tooltip-format-charging\": \"[^\"]*\)\"/\1 (limit: ${SELECTED_BATTERY_LIMIT}%)\"/" "$WAYBAR_CONF"
-
-            # Add or update tooltip-format-full
-            if grep -q '"tooltip-format-full"' "$WAYBAR_CONF"; then
-                sed -i "s/\(\"tooltip-format-full\": \"[^\"]*\)\"/\1 (limit: ${SELECTED_BATTERY_LIMIT}%)\"/" "$WAYBAR_CONF"
-            else
-                sed -i "/\"tooltip-format-charging\"/a\\    \"tooltip-format-full\": \"Full (limit: ${SELECTED_BATTERY_LIMIT}%)\"," "$WAYBAR_CONF"
-            fi
-
-            # Set format-plugged to battery full icon (instead of plug icon)
-            sed -i "s|\"format-plugged\": \"[^\"]*\"|\"format-plugged\": \"${bat_full_icon}\"|" "$WAYBAR_CONF"
-            # Add tooltip for plugged state (at limit, AC connected)
-            sed -i "/\"tooltip-format-full\"/a\\    \"tooltip-format-plugged\": \"{capacity}% plugged (limit: ${SELECTED_BATTERY_LIMIT}%)\"," "$WAYBAR_CONF"
-        else
-            # Restore original format-plugged value
-            local orig_plugged
-            orig_plugged=$(sed -n 's|.*// a-la-carchy-original-plugged: "\([^"]*\)".*|\1|p' "$WAYBAR_CONF" | head -1)
-            sed -i "s|\"format-plugged\": \"[^\"]*\"|\"format-plugged\": \"${orig_plugged}\"|" "$WAYBAR_CONF"
-            # Remove the saved original comment
-            sed -i '/a-la-carchy-original-plugged/d' "$WAYBAR_CONF"
-        fi
-
-        # Restart waybar to apply tooltip changes
-        if command -v omarchy-restart-waybar &>/dev/null; then
-            omarchy-restart-waybar &>/dev/null || true
-        fi
-        echo -e "    ${CHECKED}✓${RESET}  Waybar battery tooltip updated"
-    fi
-
-    # Install helper script and power menu override for walker integration
+    # Install helper script and the Omarchy menu charge-limit picker
     if [[ "$SELECTED_BATTERY_LIMIT" != "100" ]]; then
         install_battery_limit_helper
         install_power_menu_override
@@ -3011,7 +2936,7 @@ apply_battery_limit() {
     echo
 }
 
-# Install standalone helper script for setting battery limit from walker power menu.
+# Install standalone helper script for setting battery limit from the Omarchy menu.
 # Uses pkexec (not sudo) since it runs from a GUI context with no terminal.
 install_battery_limit_helper() {
     local script_dir
@@ -3024,7 +2949,6 @@ install_battery_limit_helper() {
 # Managed by A La Carchy - do not edit manually
 
 LIMIT="${1:-80}"
-WAYBAR_CONF="$HOME/.config/waybar/config.jsonc"
 UDEV_RULE="/etc/udev/rules.d/99-battery-charge-limit.rules"
 
 # Find battery threshold path
@@ -3058,46 +2982,6 @@ if [[ $? -ne 0 ]]; then
     exit 1
 fi
 
-# Update waybar battery tooltips
-if [[ -f "$WAYBAR_CONF" ]]; then
-    # Read format-full icon to reuse for format-plugged when limit is active
-    bat_full_icon=$(sed -n 's/.*"format-full": "\([^"]*\)".*/\1/p' "$WAYBAR_CONF" | head -1)
-
-    # Save original format-plugged value before first modification
-    if ! grep -q 'a-la-carchy-original-plugged' "$WAYBAR_CONF"; then
-        orig_plugged=$(sed -n 's/.*"format-plugged": "\([^"]*\)".*/\1/p' "$WAYBAR_CONF" | head -1)
-        sed -i "s|\"format-plugged\":|\\/\\/ a-la-carchy-original-plugged: \"${orig_plugged}\"\n    \"format-plugged\":|" "$WAYBAR_CONF"
-    fi
-
-    # Strip existing limit annotations
-    sed -i 's/ (limit: [0-9]*%)//g' "$WAYBAR_CONF"
-    sed -i '/"tooltip-format-full": "Full"/d' "$WAYBAR_CONF"
-    sed -i '/"tooltip-format-plugged":/d' "$WAYBAR_CONF"
-
-    if [[ "$LIMIT" != "100" ]]; then
-        sed -i "s/\(\"tooltip-format-discharging\": \"[^\"]*\)\"/\1 (limit: ${LIMIT}%)\"/" "$WAYBAR_CONF"
-        sed -i "s/\(\"tooltip-format-charging\": \"[^\"]*\)\"/\1 (limit: ${LIMIT}%)\"/" "$WAYBAR_CONF"
-
-        if grep -q '"tooltip-format-full"' "$WAYBAR_CONF"; then
-            sed -i "s/\(\"tooltip-format-full\": \"[^\"]*\)\"/\1 (limit: ${LIMIT}%)\"/" "$WAYBAR_CONF"
-        else
-            sed -i "/\"tooltip-format-charging\"/a\\    \"tooltip-format-full\": \"Full (limit: ${LIMIT}%)\"," "$WAYBAR_CONF"
-        fi
-
-        sed -i "s|\"format-plugged\": \"[^\"]*\"|\"format-plugged\": \"${bat_full_icon}\"|" "$WAYBAR_CONF"
-        sed -i "/\"tooltip-format-full\"/a\\    \"tooltip-format-plugged\": \"{capacity}% plugged (limit: ${LIMIT}%)\"," "$WAYBAR_CONF"
-    else
-        orig_plugged=$(sed -n 's|.*// a-la-carchy-original-plugged: "\([^"]*\)".*|\1|p' "$WAYBAR_CONF" | head -1)
-        sed -i "s|\"format-plugged\": \"[^\"]*\"|\"format-plugged\": \"${orig_plugged}\"|" "$WAYBAR_CONF"
-        sed -i '/a-la-carchy-original-plugged/d' "$WAYBAR_CONF"
-    fi
-
-    # Restart waybar to apply tooltip changes
-    if command -v omarchy-restart-waybar &>/dev/null; then
-        omarchy-restart-waybar &>/dev/null || true
-    fi
-fi
-
 notify-send "Battery Limit" "Charge limit set to ${LIMIT}%" -i battery
 HELPEREOF
 
@@ -3105,119 +2989,49 @@ HELPEREOF
     echo -e "    ${CHECKED}✓${RESET}  Battery limit helper installed: $BATTERY_LIMIT_HELPER"
 }
 
-# Install power menu override that adds charge limit slider to the walker power profile menu.
-# Writes a managed block into ~/.config/omarchy/extensions/menu.sh.
+# Add a Setup > Battery Limit picker to the Omarchy menu (JSONC extension).
+# Rows run the helper, which applies the limit via pkexec.
+POWER_MENU_MARKER_START="  // >>> a-la-carchy battery-limit"
+POWER_MENU_MARKER_END="  // <<< a-la-carchy battery-limit"
+
+remove_power_menu_override() {
+    [[ -f "$MENU_JSONC" ]] && grep -qxF -- "$POWER_MENU_MARKER_START" "$MENU_JSONC" || return 1
+    awk -v s="$POWER_MENU_MARKER_START" -v e="$POWER_MENU_MARKER_END" '
+        $0 == s { skip = 1; next }
+        $0 == e { skip = 0; next }
+        !skip { print }
+    ' "$MENU_JSONC" > "${MENU_JSONC}.tmp" && mv "${MENU_JSONC}.tmp" "$MENU_JSONC"
+    omarchy-menu refresh &>/dev/null || true
+}
+
 install_power_menu_override() {
-    local ext_file="$HOME/.config/omarchy/extensions/menu.sh"
-    local ext_dir
-    ext_dir="$(dirname "$ext_file")"
-    mkdir -p "$ext_dir"
+    mkdir -p "$(dirname "$MENU_JSONC")"
+    [[ -f "$MENU_JSONC" ]] || printf '{\n}\n' > "$MENU_JSONC"
+    remove_power_menu_override
 
-    # Remove existing managed block if present
-    if [ -f "$ext_file" ]; then
-        awk -v start="$POWER_MENU_MARKER_START" -v end="$POWER_MENU_MARKER_END" '
-            $0 == start { skip=1; next }
-            $0 == end   { skip=0; next }
-            !skip
-        ' "$ext_file" > "${ext_file}.tmp" && mv "${ext_file}.tmp" "$ext_file"
-    fi
+    local threshold='cat /sys/class/power_supply/BAT*/charge_control_end_threshold 2>/dev/null | head -1'
+    local lines="" pct label
+    lines+="  \"setup.battery-limit\": $(jq -cn --arg when "[[ -n \"\$($threshold)\" ]]" \
+        '{icon: "󰂄", label: "Battery Limit", aliases: ["charge-limit"], when: $when}'),"$'\n'
+    for pct in 60 70 80 90 100; do
+        case "$pct" in
+            60)  label="60% - Max longevity" ;;
+            80)  label="80% - Recommended" ;;
+            100) label="100% - No limit" ;;
+            *)   label="${pct}%" ;;
+        esac
+        lines+="  \"setup.battery-limit.$pct\": $(jq -cn --arg label "$label" \
+            --arg checked "[[ \"\$($threshold)\" == $pct ]]" --arg action "$BATTERY_LIMIT_HELPER $pct" \
+            '{icon: "󰁹", label: $label, checked: $checked, action: $action}'),"$'\n'
+    done
 
-    # Append the power menu override block
-    {
-        echo "$POWER_MENU_MARKER_START"
+    ALC_BODY="${lines%$'\n'}" awk -v s="$POWER_MENU_MARKER_START" -v e="$POWER_MENU_MARKER_END" '
+        !done && /^[[:space:]]*\{[[:space:]]*$/ { print; print s; print ENVIRON["ALC_BODY"]; print e; done = 1; next }
+        { print }
+    ' "$MENU_JSONC" > "${MENU_JSONC}.tmp" && mv "${MENU_JSONC}.tmp" "$MENU_JSONC"
+    omarchy-menu refresh &>/dev/null || true
 
-        # Helper: generate a 20-char visual bar for charge percentage (scaled to 60-100 range)
-        cat << 'PMEOF'
-_alc_charge_bar() {
-  local pct="${1:-80}"
-  local bar_len=20
-  local filled=$(( pct * bar_len / 100 ))
-  [[ $filled -lt 0 ]] && filled=0
-  [[ $filled -gt $bar_len ]] && filled=$bar_len
-  local empty=$((bar_len - filled))
-  local bar=""
-  for ((i=0; i<filled; i++)); do bar+="█"; done
-  for ((i=0; i<empty; i++)); do bar+="░"; done
-  echo "  ${bar}  ${pct}%"
-}
-
-_alc_show_charge_limit_submenu() {
-  local current_limit
-  current_limit=$(cat /sys/class/power_supply/BAT*/charge_control_end_threshold 2>/dev/null | head -1)
-  [[ -z "$current_limit" ]] && current_limit=100
-
-  local options="60%  — Max longevity\n70%\n80%  — Recommended\n90%\n100% — No limit"
-
-  # Pre-select current value
-  local preselect=""
-  case "$current_limit" in
-    60) preselect="60%  — Max longevity" ;;
-    70) preselect="70%" ;;
-    80) preselect="80%  — Recommended" ;;
-    90) preselect="90%" ;;
-    *)  preselect="100% — No limit" ;;
-  esac
-
-  local choice
-  choice=$(menu "Charge Limit" "$options" "" "$preselect")
-
-  if [[ "$choice" == "CNCLD" || -z "$choice" ]]; then
-    show_setup_power_menu
-    return
-  fi
-
-  # Extract percentage number from choice
-  local pct
-  pct=$(echo "$choice" | grep -oP '^\d+')
-  [[ -z "$pct" ]] && return
-
-  "$HOME/.config/hypr/scripts/omarchy-battery-limit.sh" "$pct"
-}
-
-show_setup_power_menu() {
-  local profiles
-  profiles=$(omarchy-powerprofiles-list)
-  local current_profile
-  current_profile=$(powerprofilesctl get)
-
-  # Check for battery hardware
-  local bat_threshold=""
-  for p in /sys/class/power_supply/BAT*/charge_control_end_threshold; do
-    [[ -f "$p" ]] && { bat_threshold="$p"; break; }
-  done
-
-  local options="$profiles"
-  local preselect="$current_profile"
-
-  if [[ -n "$bat_threshold" ]]; then
-    local current_limit
-    current_limit=$(cat "$bat_threshold" 2>/dev/null)
-    [[ -z "$current_limit" ]] && current_limit=100
-    local bar
-    bar=$(_alc_charge_bar "$current_limit")
-    options="${options}\n─────────────────\n󰁹 Charge limit: ${current_limit}%\n${bar}"
-  fi
-
-  local choice
-  choice=$(menu "Power" "$options" "" "$preselect")
-
-  if [[ "$choice" == "CNCLD" || -z "$choice" ]]; then
-    back_to show_setup_menu
-    return
-  fi
-
-  case "$choice" in
-    ─*) show_setup_power_menu ;;
-    *"Charge limit"*|*█*|*░*) _alc_show_charge_limit_submenu ;;
-    *) powerprofilesctl set "$choice" ;;
-  esac
-}
-PMEOF
-
-        echo "$POWER_MENU_MARKER_END"
-    } >> "$ext_file"
-
-    echo -e "    ${CHECKED}✓${RESET}  Power menu charge limit override installed"
+    echo -e "    ${CHECKED}✓${RESET}  Charge limit picker added to Omarchy menu (Setup > Battery Limit)"
 }
 
 # =============================================================================
@@ -5304,565 +5118,113 @@ apply_rog_fan_curve() {
 }
 
 bind_shutdown() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Bind Shutdown to SUPER+ALT+S${RESET}"
-    echo
-    echo -e "  ${DIM}Adds a keybinding to shutdown the system with SUPER+ALT+S.${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$BINDINGS_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  bindings.conf not found at $BINDINGS_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Bind shutdown -- failed (config not found)")
-        return 1
-    fi
-
-    if grep -q "SUPER ALT, S, Shutdown" "$BINDINGS_CONF"; then
-        echo -e "  ${DIM}Already bound. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Bind shutdown -- already set")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Bind shutdown -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    local backup_file="${BINDINGS_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$BINDINGS_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    echo "" >> "$BINDINGS_CONF"
-    echo "bindd = SUPER ALT, S, Shutdown, exec, systemctl poweroff" >> "$BINDINGS_CONF"
-
-    echo -e "  ${DIM}✓${RESET}  Bound SUPER+ALT+S to shutdown"
-    SUMMARY_LOG+=("✓  Bound shutdown to SUPER+ALT+S")
-    echo
+    apply_lua_block "Bind Shutdown to SUPER+ALT+S" \
+        "Adds a keybinding to shut down the system with SUPER+ALT+S (replaces 'Move window to scratchpad')." \
+        "$BINDINGS_LUA" "shutdown" "Bound shutdown to SUPER+ALT+S" \
+        'hl.unbind("SUPER + ALT + S")
+o.bind("SUPER + ALT + S", "Shutdown", "systemctl poweroff")'
 }
 
 bind_restart() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Bind Restart to SUPER+ALT+R${RESET}"
-    echo
-    echo -e "  ${DIM}Adds a keybinding to restart the system with SUPER+ALT+R.${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$BINDINGS_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  bindings.conf not found at $BINDINGS_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Bind restart -- failed (config not found)")
-        return 1
-    fi
-
-    if grep -q "SUPER ALT, R, Restart" "$BINDINGS_CONF"; then
-        echo -e "  ${DIM}Already bound. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Bind restart -- already set")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Bind restart -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    local backup_file="${BINDINGS_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$BINDINGS_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    echo "" >> "$BINDINGS_CONF"
-    echo "bindd = SUPER ALT, R, Restart, exec, systemctl reboot" >> "$BINDINGS_CONF"
-
-    echo -e "  ${DIM}✓${RESET}  Bound SUPER+ALT+R to restart"
-    SUMMARY_LOG+=("✓  Bound restart to SUPER+ALT+R")
-    echo
+    apply_lua_block "Bind Restart to SUPER+ALT+R" \
+        "Adds a keybinding to restart the system with SUPER+ALT+R." \
+        "$BINDINGS_LUA" "restart" "Bound restart to SUPER+ALT+R" \
+        'hl.unbind("SUPER + ALT + R")
+o.bind("SUPER + ALT + R", "Restart", "systemctl reboot")'
 }
 
 unbind_shutdown() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Unbind Shutdown (SUPER+ALT+S)${RESET}"
-    echo
-    echo -e "  ${DIM}Removes the shutdown keybinding from bindings.conf.${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$BINDINGS_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  bindings.conf not found at $BINDINGS_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Unbind shutdown -- failed (config not found)")
-        return 1
-    fi
-
-    if ! grep -q "SUPER ALT, S, Shutdown" "$BINDINGS_CONF"; then
-        echo -e "  ${DIM}Not bound. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Unbind shutdown -- not bound")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Unbind shutdown -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    local backup_file="${BINDINGS_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$BINDINGS_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    sed -i '/SUPER ALT, S, Shutdown/d' "$BINDINGS_CONF"
-
-    echo -e "  ${DIM}✓${RESET}  Unbound SUPER+ALT+S (shutdown)"
-    SUMMARY_LOG+=("✓  Unbound shutdown (SUPER+ALT+S)")
-    echo
+    apply_lua_block "Unbind Shutdown (SUPER+ALT+S)" \
+        "Removes the shutdown keybinding and restores the Omarchy default." \
+        "$BINDINGS_LUA" "shutdown" "Unbound shutdown (SUPER+ALT+S)"
 }
 
 unbind_restart() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Unbind Restart (SUPER+ALT+R)${RESET}"
-    echo
-    echo -e "  ${DIM}Removes the restart keybinding from bindings.conf.${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$BINDINGS_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  bindings.conf not found at $BINDINGS_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Unbind restart -- failed (config not found)")
-        return 1
-    fi
-
-    if ! grep -q "SUPER ALT, R, Restart" "$BINDINGS_CONF"; then
-        echo -e "  ${DIM}Not bound. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Unbind restart -- not bound")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Unbind restart -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    local backup_file="${BINDINGS_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$BINDINGS_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    sed -i '/SUPER ALT, R, Restart/d' "$BINDINGS_CONF"
-
-    echo -e "  ${DIM}✓${RESET}  Unbound SUPER+ALT+R (restart)"
-    SUMMARY_LOG+=("✓  Unbound restart (SUPER+ALT+R)")
-    echo
+    apply_lua_block "Unbind Restart (SUPER+ALT+R)" \
+        "Removes the restart keybinding." \
+        "$BINDINGS_LUA" "restart" "Unbound restart (SUPER+ALT+R)"
 }
 
 bind_theme_menu() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Bind Theme Menu to ALT+T${RESET}"
-    echo
-    echo -e "  ${DIM}Adds a keybinding to open the theme menu with ALT+T.${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$BINDINGS_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  bindings.conf not found at $BINDINGS_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Bind theme menu -- failed (config not found)")
-        return 1
-    fi
-
-    if grep -q "ALT, T, Theme menu" "$BINDINGS_CONF"; then
-        echo -e "  ${DIM}Already bound. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Bind theme menu -- already set")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Bind theme menu -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    local backup_file="${BINDINGS_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$BINDINGS_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    echo "" >> "$BINDINGS_CONF"
-    echo "bindd = ALT, T, Theme menu, exec, omarchy-launch-walker -m menus:omarchythemes --width 800 --minheight 400" >> "$BINDINGS_CONF"
-
-    echo -e "  ${DIM}✓${RESET}  Bound ALT+T to theme menu"
-    SUMMARY_LOG+=("✓  Bound theme menu to ALT+T")
-    echo
+    apply_lua_block "Bind Theme Menu to ALT+T" \
+        "Adds a keybinding to open the theme menu with ALT+T." \
+        "$BINDINGS_LUA" "theme-menu" "Bound theme menu to ALT+T" \
+        'hl.unbind("ALT + T")
+o.bind("ALT + T", "Theme menu", "omarchy-menu toggle theme")'
 }
 
 unbind_theme_menu() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Unbind Theme Menu (ALT+T)${RESET}"
-    echo
-    echo -e "  ${DIM}Removes the theme menu keybinding from bindings.conf.${RESET}"
-    echo
-    echo
+    apply_lua_block "Unbind Theme Menu (ALT+T)" \
+        "Removes the theme menu keybinding." \
+        "$BINDINGS_LUA" "theme-menu" "Unbound theme menu (ALT+T)"
+}
 
-    if [[ ! -f "$BINDINGS_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  bindings.conf not found at $BINDINGS_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Unbind theme menu -- failed (config not found)")
-        return 1
+# Omarchy's default kb_options (default/hypr/input.lua)
+OMARCHY_KB_OPTIONS="compose:caps,shift:both_capslock_cancel"
+
+# Current effective kb_options: our managed block if present, else Hyprland's live value
+current_kb_options() {
+    local v
+    v=$(lua_block_get "$INPUT_LUA" "kb-options" | grep -oP 'kb_options = "\K[^"]*')
+    if [[ -z "$v" ]] && command -v hyprctl &>/dev/null; then
+        v=$(hyprctl getoption input:kb_options 2>/dev/null | grep -oP '^str: \K.*')
+    fi
+    [[ -z "$v" ]] && v="$OMARCHY_KB_OPTIONS"
+    echo "$v"
+}
+
+# Rewrite kb_options: drop the options in $3 and add those in $4 (space-separated)
+edit_kb_options() {
+    local title="$1" summary="$2" remove="$3" add="$4" explain="$5"
+    local current new opt
+    current="$(current_kb_options)"
+
+    local -a kept=()
+    IFS=',' read -ra opts <<< "$current"
+    for opt in "${opts[@]}"; do
+        [[ -z "$opt" || " $remove $add " == *" $opt "* ]] && continue
+        kept+=("$opt")
+    done
+    for opt in $add; do
+        kept+=("$opt")
+    done
+    new=$(IFS=','; echo "${kept[*]}")
+
+    # Back to Omarchy's default set: remove our block instead of pinning it
+    local sorted_new sorted_default
+    sorted_new=$(tr ',' '\n' <<< "$new" | sort | paste -sd,)
+    sorted_default=$(tr ',' '\n' <<< "$OMARCHY_KB_OPTIONS" | sort | paste -sd,)
+    if [[ "$sorted_new" == "$sorted_default" ]]; then
+        apply_lua_block "$title" "$explain" "$INPUT_LUA" "kb-options" "$summary"
+        return
     fi
 
-    if ! grep -q "ALT, T, Theme menu" "$BINDINGS_CONF"; then
-        echo -e "  ${DIM}Not bound. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Unbind theme menu -- not bound")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Unbind theme menu -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    local backup_file="${BINDINGS_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$BINDINGS_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    sed -i '/ALT, T, Theme menu/d' "$BINDINGS_CONF"
-
-    echo -e "  ${DIM}✓${RESET}  Unbound ALT+T (theme menu)"
-    SUMMARY_LOG+=("✓  Unbound theme menu (ALT+T)")
-    echo
+    apply_lua_block "$title" "$explain" "$INPUT_LUA" "kb-options" "$summary" \
+        "hl.config({ input = { kb_options = \"$new\" } })"
 }
 
 restore_capslock() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Restore Caps Lock Key${RESET}"
-    echo
-    echo -e "  ${DIM}Returns Caps Lock to normal behavior (typing in CAPITALS).${RESET}"
-    echo -e "  ${DIM}Moves compose key to Right Alt, so shortcuts still work:${RESET}"
-    echo -e "  ${DIM}  • Right Alt + Space + Space → em dash (—)${RESET}"
-    echo -e "  ${DIM}  • Right Alt + Space + n → your name${RESET}"
-    echo -e "  ${DIM}  • Right Alt + Space + e → your email${RESET}"
-    echo -e "  ${DIM}  • Right Alt + m + s → 😄 (and all other emojis)${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$INPUT_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  input.conf not found at $INPUT_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Restore Caps Lock -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if already using ralt
-    if grep -q "kb_options = compose:ralt" "$INPUT_CONF"; then
-        echo -e "  ${DIM}Caps Lock already restored. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Restore Caps Lock -- already set")
-        return 0
-    fi
-
-    # Check if compose:caps exists
-    if ! grep -q "kb_options = compose:caps" "$INPUT_CONF"; then
-        echo -e "  ${DIM}compose:caps not found in config. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Restore Caps Lock -- compose:caps not found")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Restore Caps Lock -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${INPUT_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$INPUT_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Replace compose:caps with compose:ralt
-    sed -i 's/kb_options = compose:caps/kb_options = compose:ralt/' "$INPUT_CONF"
-
-    echo -e "  ${CHECKED}✓${RESET}  Caps Lock restored (compose moved to Right Alt)"
-    SUMMARY_LOG+=("✓  Restored Caps Lock (compose on Right Alt)")
-    echo
-    echo -e "  ${DIM}Hyprland will auto-reload the config.${RESET}"
-    echo
+    edit_kb_options "Restore Caps Lock Key" "Caps Lock restored (compose on Right Alt)" \
+        "compose:caps" "compose:ralt" \
+        "Returns Caps Lock to normal behavior. Compose moves to Right Alt (Right Alt + Space + Space → —)."
 }
 
 use_capslock_compose() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Use Caps Lock for Compose${RESET}"
-    echo
-    echo -e "  ${DIM}Returns to Omarchy default: Caps Lock as compose key.${RESET}"
-    echo -e "  ${DIM}  • Caps Lock + Space + Space → em dash (—)${RESET}"
-    echo -e "  ${DIM}  • Caps Lock + m + s → 😄 (emojis)${RESET}"
-    echo -e "  ${DIM}  • No Caps Lock for CAPITALS${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$INPUT_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  input.conf not found at $INPUT_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Use Caps Lock compose -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if already using caps
-    if grep -q "kb_options = compose:caps" "$INPUT_CONF"; then
-        echo -e "  ${DIM}Already using Caps Lock for compose. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Use Caps Lock compose -- already set")
-        return 0
-    fi
-
-    # Check if compose:ralt exists
-    if ! grep -q "kb_options = compose:ralt" "$INPUT_CONF"; then
-        echo -e "  ${DIM}compose:ralt not found in config. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Use Caps Lock compose -- compose:ralt not found")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Use Caps Lock compose -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${INPUT_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$INPUT_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Replace compose:ralt with compose:caps
-    sed -i 's/kb_options = compose:ralt/kb_options = compose:caps/' "$INPUT_CONF"
-
-    echo -e "  ${CHECKED}✓${RESET}  Caps Lock now used for compose (Omarchy default)"
-    SUMMARY_LOG+=("✓  Caps Lock used for compose")
-    echo
-    echo -e "  ${DIM}Hyprland will auto-reload the config.${RESET}"
-    echo
+    edit_kb_options "Use Caps Lock for Compose" "Caps Lock set as compose key" \
+        "compose:ralt" "compose:caps" \
+        "Returns to Omarchy default: Caps Lock as compose key (Caps Lock + Space + Space → —)."
 }
 
 swap_alt_super() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Swap Alt and Super Keys${RESET}"
-    echo
-    echo -e "  ${DIM}Makes Alt behave as Super and Super behave as Alt.${RESET}"
-    echo -e "  ${DIM}Useful for macOS-like shortcuts (Alt+Q to close, etc).${RESET}"
-    echo
-    echo -e "  ${DIM}After this tweak:${RESET}"
-    echo -e "  ${DIM}  • Alt + Return → Terminal (was Super + Return)${RESET}"
-    echo -e "  ${DIM}  • Alt + Q → Close window (was Super + Q)${RESET}"
-    echo -e "  ${DIM}  • Alt + Space → App launcher (was Super + Space)${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$INPUT_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  input.conf not found at $INPUT_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Swap Alt/Super -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if already swapped
-    if grep -q "altwin:swap_alt_win" "$INPUT_CONF"; then
-        echo -e "  ${DIM}Alt and Super already swapped. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Swap Alt/Super -- already swapped")
-        return 0
-    fi
-
-    # Check if kb_options line exists
-    if ! grep -q "kb_options = " "$INPUT_CONF"; then
-        echo -e "  ${DIM}kb_options not found in config. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Swap Alt/Super -- kb_options not found")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Swap Alt/Super -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${INPUT_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$INPUT_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Append altwin:swap_alt_win to kb_options (handles both compose:caps and compose:ralt)
-    sed -i 's/\(kb_options = [^#]*\)/\1,altwin:swap_alt_win/' "$INPUT_CONF"
-
-    echo -e "  ${CHECKED}✓${RESET}  Alt and Super keys swapped"
-    SUMMARY_LOG+=("✓  Swapped Alt and Super keys")
-    echo
-    echo -e "  ${DIM}Hyprland will auto-reload the config.${RESET}"
-    echo
+    edit_kb_options "Swap Alt and Super Keys" "Alt and Super swapped" \
+        "" "altwin:swap_alt_win" \
+        "Makes Alt behave as Super and Super behave as Alt (macOS-like shortcuts)."
 }
 
 restore_alt_super() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Restore Alt and Super Keys${RESET}"
-    echo
-    echo -e "  ${DIM}Returns Alt and Super to their normal behavior.${RESET}"
-    echo -e "  ${DIM}Super key will be used for window management (Omarchy default).${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$INPUT_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  input.conf not found at $INPUT_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Restore Alt/Super -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if swap is active
-    if ! grep -q "altwin:swap_alt_win" "$INPUT_CONF"; then
-        echo -e "  ${DIM}Alt and Super not swapped. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Restore Alt/Super -- not swapped")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Restore Alt/Super -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${INPUT_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$INPUT_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Remove altwin:swap_alt_win from kb_options
-    sed -i 's/,altwin:swap_alt_win//' "$INPUT_CONF"
-
-    echo -e "  ${CHECKED}✓${RESET}  Alt and Super keys restored to normal"
-    SUMMARY_LOG+=("✓  Restored Alt and Super keys")
-    echo
-    echo -e "  ${DIM}Hyprland will auto-reload the config.${RESET}"
-    echo
+    edit_kb_options "Restore Alt and Super Keys" "Alt and Super restored" \
+        "altwin:swap_alt_win" "" \
+        "Returns Alt and Super to their normal behavior (Omarchy default)."
 }
 
 enable_suspend() {
@@ -5877,7 +5239,7 @@ enable_suspend() {
     echo
 
     # Check if already enabled
-    if [[ -f "$SUSPEND_STATE" ]]; then
+    if [[ ! -f "$SUSPEND_OFF_FLAG" ]]; then
         echo -e "  ${DIM}Suspend already enabled. Nothing to do.${RESET}"
         echo
         SUMMARY_LOG+=("--  Enable suspend -- already enabled")
@@ -5899,9 +5261,7 @@ enable_suspend() {
 
     echo
 
-    # Create state directory and file
-    mkdir -p "$(dirname "$SUSPEND_STATE")"
-    touch "$SUSPEND_STATE"
+    rm -f "$SUSPEND_OFF_FLAG"
 
     echo -e "  ${CHECKED}✓${RESET}  Suspend enabled in system menu"
     SUMMARY_LOG+=("✓  Enabled suspend")
@@ -5919,7 +5279,7 @@ disable_suspend() {
     echo
 
     # Check if already disabled
-    if [[ ! -f "$SUSPEND_STATE" ]]; then
+    if [[ -f "$SUSPEND_OFF_FLAG" ]]; then
         echo -e "  ${DIM}Suspend already disabled. Nothing to do.${RESET}"
         echo
         SUMMARY_LOG+=("--  Disable suspend -- already disabled")
@@ -5941,8 +5301,8 @@ disable_suspend() {
 
     echo
 
-    # Remove state file
-    rm -f "$SUSPEND_STATE"
+    mkdir -p "$(dirname "$SUSPEND_OFF_FLAG")"
+    touch "$SUSPEND_OFF_FLAG"
 
     echo -e "  ${CHECKED}✓${RESET}  Suspend disabled in system menu"
     SUMMARY_LOG+=("✓  Disabled suspend")
@@ -6085,11 +5445,11 @@ enable_fingerprint() {
     fi
 
     echo
-    echo -e "  ${DIM}Running omarchy-setup-fingerprint...${RESET}"
+    echo -e "  ${DIM}Running omarchy-setup-security-fingerprint...${RESET}"
     echo
 
     # Run the setup script
-    if omarchy-setup-fingerprint; then
+    if omarchy-setup-security-fingerprint; then
         echo
         echo -e "  ${CHECKED}✓${RESET}  Fingerprint authentication enabled"
         SUMMARY_LOG+=("✓  Enabled fingerprint authentication")
@@ -6133,11 +5493,11 @@ disable_fingerprint() {
     fi
 
     echo
-    echo -e "  ${DIM}Running omarchy-setup-fingerprint --remove...${RESET}"
+    echo -e "  ${DIM}Running omarchy-remove-security-fingerprint...${RESET}"
     echo
 
     # Run the remove script
-    if omarchy-setup-fingerprint --remove; then
+    if omarchy-remove-security-fingerprint; then
         echo
         echo -e "  ${CHECKED}✓${RESET}  Fingerprint authentication disabled"
         SUMMARY_LOG+=("✓  Disabled fingerprint authentication")
@@ -6185,11 +5545,11 @@ enable_fido2() {
     fi
 
     echo
-    echo -e "  ${DIM}Running omarchy-setup-fido2...${RESET}"
+    echo -e "  ${DIM}Running omarchy-setup-security-fido2...${RESET}"
     echo
 
     # Run the setup script
-    if omarchy-setup-fido2; then
+    if omarchy-setup-security-fido2; then
         echo
         echo -e "  ${CHECKED}✓${RESET}  FIDO2 authentication enabled"
         SUMMARY_LOG+=("✓  Enabled FIDO2 authentication")
@@ -6233,11 +5593,11 @@ disable_fido2() {
     fi
 
     echo
-    echo -e "  ${DIM}Running omarchy-setup-fido2 --remove...${RESET}"
+    echo -e "  ${DIM}Running omarchy-remove-security-fido2...${RESET}"
     echo
 
     # Run the remove script
-    if omarchy-setup-fido2 --remove; then
+    if omarchy-remove-security-fido2; then
         echo
         echo -e "  ${CHECKED}✓${RESET}  FIDO2 authentication disabled"
         SUMMARY_LOG+=("✓  Disabled FIDO2 authentication")
@@ -6249,1316 +5609,236 @@ disable_fido2() {
     echo
 }
 
+# Ids of the tray items currently registered with the StatusNotifier watcher
+tray_item_ids() {
+    local item svc path
+    for item in $(busctl --user get-property org.kde.StatusNotifierWatcher /StatusNotifierWatcher \
+            org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems 2>/dev/null | grep -o '"[^"]*"' | tr -d '"'); do
+        svc="${item%%/*}"
+        path="/StatusNotifierItem"
+        [[ "$item" == */* ]] && path="/${item#*/}"
+        busctl --user get-property "$svc" "$path" org.kde.StatusNotifierItem Id 2>/dev/null | grep -oP '^s "\K[^"]+'
+    done
+}
+
+_tray_all_pinned() {
+    local ids pinned id
+    ids=$(tray_item_ids)
+    [[ -z "$ids" ]] && return 0
+    pinned=$(jq -r '[.bar.layout[]?[]? | select(.id == "omarchy.tray") | .pinned[]?] | .[]' "$SHELL_JSON" 2>/dev/null)
+    for id in $ids; do
+        grep -qxF "$id" <<< "$pinned" || return 1
+    done
+    return 0
+}
+
+_tray_pin_all() {
+    local ids_json
+    ids_json=$(tray_item_ids | jq -R . | jq -s .)
+    shell_json_jq --argjson ids "$ids_json" '
+        .bar.layout |= with_entries(.value |= map(
+            if .id == "omarchy.tray" then .pinned = ((.pinned // []) + $ids | unique) | .hidden = ((.hidden // []) - $ids) else . end))
+    '
+}
+
 show_all_tray_icons() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Show All Tray Icons${RESET}"
-    echo
-    echo -e "  ${DIM}Reveals all system tray icons (Dropbox, 1Password, Steam, etc).${RESET}"
-    echo -e "  ${DIM}Icons will always be visible instead of hidden under an expander.${RESET}"
-    echo
-    echo
+    apply_shell_change "Show All Tray Icons" \
+        "Pins every running tray app so its icon stays visible instead of collapsing into the tray drawer." \
+        "Pinned all tray icons" _tray_all_pinned _tray_pin_all
+}
 
-    if [[ ! -f "$WAYBAR_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  waybar config not found at $WAYBAR_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Show all tray icons -- failed (config not found)")
-        return 1
-    fi
+_tray_none_pinned() {
+    [[ -z "$(jq -r '[.bar.layout[]?[]? | select(.id == "omarchy.tray") | .pinned[]?] | .[]' "$SHELL_JSON" 2>/dev/null)" ]]
+}
 
-    # Check if already showing all icons (look for "tray", in modules-right, not the group definition)
-    # The group definition has "group/tray-expander": (with colon), modules-right has "group/tray-expander", (with comma)
-    if ! grep -q '"group/tray-expander",' "$WAYBAR_CONF"; then
-        echo -e "  ${DIM}Tray icons already visible (or tray-expander not in modules).${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Show all tray icons -- already set or not applicable")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Show all tray icons -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${WAYBAR_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$WAYBAR_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Replace group/tray-expander with tray (only the one with comma, not the group definition with colon)
-    sed -i 's/"group\/tray-expander",/"tray",/' "$WAYBAR_CONF"
-
-    # Restart waybar to apply
-    if command -v omarchy-restart-waybar &>/dev/null; then
-        omarchy-restart-waybar &>/dev/null || true
-    fi
-
-    echo -e "  ${CHECKED}✓${RESET}  All tray icons now visible"
-    SUMMARY_LOG+=("✓  Showing all tray icons")
-    echo
+_tray_unpin_all() {
+    shell_json_jq '.bar.layout |= with_entries(.value |= map(if .id == "omarchy.tray" then .pinned = [] else . end))'
 }
 
 hide_tray_icons() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Hide Tray Icons (Use Expander)${RESET}"
-    echo
-    echo -e "  ${DIM}Hides tray icons under an expander (Omarchy default).${RESET}"
-    echo -e "  ${DIM}Click the expander icon to reveal tray icons when needed.${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$WAYBAR_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  waybar config not found at $WAYBAR_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Hide tray icons -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if already using expander (with comma = in modules-right, not the group definition with colon)
-    if grep -q '"group/tray-expander",' "$WAYBAR_CONF"; then
-        echo -e "  ${DIM}Already using tray expander. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Hide tray icons -- already set")
-        return 0
-    fi
-
-    # Check if "tray", exists in modules-right (indicates it was changed from expander)
-    if ! grep -q '"tray",' "$WAYBAR_CONF"; then
-        echo -e "  ${DIM}tray not found in modules-right. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Hide tray icons -- tray not found")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Hide tray icons -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${WAYBAR_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$WAYBAR_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Replace tray with group/tray-expander (only in modules-right context)
-    sed -i 's/"tray",/"group\/tray-expander",/' "$WAYBAR_CONF"
-
-    # Restart waybar to apply
-    if command -v omarchy-restart-waybar &>/dev/null; then
-        omarchy-restart-waybar &>/dev/null || true
-    fi
-
-    echo -e "  ${CHECKED}✓${RESET}  Tray icons now hidden under expander"
-    SUMMARY_LOG+=("✓  Hiding tray icons (using expander)")
-    echo
+    apply_shell_change "Hide Tray Icons" \
+        "Unpins all tray icons so they collapse into the tray drawer (Omarchy default)." \
+        "Tray icons collapsed into drawer" _tray_none_pinned _tray_unpin_all
 }
 
+_logo_absent() { ! shell_bar_has omarchy.menu; }
+_logo_remove() { shell_bar_remove omarchy.menu; }
+_logo_present() { shell_bar_has omarchy.menu; }
+_logo_restore() { omarchy-bar put omarchy.menu --section left --index 0 &>/dev/null; }
+
 remove_omarchy_logo() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Remove Omarchy Logo${RESET}"
-    echo
-
-    if [[ ! -f "$WAYBAR_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  waybar config not found at $WAYBAR_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Remove Omarchy logo -- failed (config not found)")
-        return 1
-    fi
-
-    if ! grep -q '"modules-left".*"custom/omarchy"' "$WAYBAR_CONF"; then
-        echo -e "  ${DIM}Omarchy logo already removed.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Remove Omarchy logo -- already removed")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Remove Omarchy logo -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    local backup_file="${WAYBAR_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$WAYBAR_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    sed -i '/modules-left/s/"custom\/omarchy", //' "$WAYBAR_CONF"
-
-    if command -v omarchy-restart-waybar &>/dev/null; then
-        omarchy-restart-waybar &>/dev/null || true
-    fi
-
-    echo -e "  ${CHECKED}✓${RESET}  Omarchy logo removed from waybar"
-    SUMMARY_LOG+=("✓  Removed Omarchy logo from waybar")
-    echo
+    apply_shell_change "Remove Omarchy Logo" \
+        "Removes the Omarchy logo menu button from the bar. The menu stays on SUPER+ALT+SPACE." \
+        "Removed Omarchy logo from bar" _logo_absent _logo_remove
 }
 
 restore_omarchy_logo() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Restore Omarchy Logo${RESET}"
-    echo
-
-    if [[ ! -f "$WAYBAR_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  waybar config not found at $WAYBAR_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Restore Omarchy logo -- failed (config not found)")
-        return 1
-    fi
-
-    if grep -q '"modules-left".*"custom/omarchy"' "$WAYBAR_CONF"; then
-        echo -e "  ${DIM}Omarchy logo already present.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Restore Omarchy logo -- already present")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Restore Omarchy logo -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    local backup_file="${WAYBAR_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$WAYBAR_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    sed -i '/modules-left/s/\["hyprland/["custom\/omarchy", "hyprland/' "$WAYBAR_CONF"
-
-    if command -v omarchy-restart-waybar &>/dev/null; then
-        omarchy-restart-waybar &>/dev/null || true
-    fi
-
-    echo -e "  ${CHECKED}✓${RESET}  Omarchy logo restored to waybar"
-    SUMMARY_LOG+=("✓  Restored Omarchy logo to waybar")
-    echo
+    apply_shell_change "Restore Omarchy Logo" \
+        "Puts the Omarchy logo menu button back at the left of the bar." \
+        "Restored Omarchy logo to bar" _logo_present _logo_restore
 }
 
+_update_absent() { ! shell_bar_has omarchy.system-update; }
+_update_remove() { shell_bar_remove omarchy.system-update; }
+_update_present() { shell_bar_has omarchy.system-update; }
+_update_restore() { omarchy-bar put omarchy.system-update &>/dev/null; }
+
 remove_update_icon() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Remove Update Icon${RESET}"
-    echo
-
-    if [[ ! -f "$WAYBAR_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  waybar config not found at $WAYBAR_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Remove update icon -- failed (config not found)")
-        return 1
-    fi
-
-    if ! grep -q '"modules-center".*"custom/update"' "$WAYBAR_CONF"; then
-        echo -e "  ${DIM}Update icon already removed.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Remove update icon -- already removed")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Remove update icon -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    local backup_file="${WAYBAR_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$WAYBAR_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    sed -i '/modules-center/s/"custom\/update", //' "$WAYBAR_CONF"
-
-    if command -v omarchy-restart-waybar &>/dev/null; then
-        omarchy-restart-waybar &>/dev/null || true
-    fi
-
-    echo -e "  ${CHECKED}✓${RESET}  Update icon removed from waybar"
-    SUMMARY_LOG+=("✓  Removed update icon from waybar")
-    echo
+    apply_shell_change "Remove Update Icon" \
+        "Removes the system update indicator from the bar." \
+        "Removed update icon from bar" _update_absent _update_remove
 }
 
 restore_update_icon() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Restore Update Icon${RESET}"
-    echo
-
-    if [[ ! -f "$WAYBAR_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  waybar config not found at $WAYBAR_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Restore update icon -- failed (config not found)")
-        return 1
-    fi
-
-    if grep -q '"modules-center".*"custom/update"' "$WAYBAR_CONF"; then
-        echo -e "  ${DIM}Update icon already present.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Restore update icon -- already present")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Restore update icon -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    local backup_file="${WAYBAR_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$WAYBAR_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    sed -i '/modules-center/s/"clock", /"clock", "custom\/update", /' "$WAYBAR_CONF"
-
-    if command -v omarchy-restart-waybar &>/dev/null; then
-        omarchy-restart-waybar &>/dev/null || true
-    fi
-
-    echo -e "  ${CHECKED}✓${RESET}  Update icon restored to waybar"
-    SUMMARY_LOG+=("✓  Restored update icon to waybar")
-    echo
+    apply_shell_change "Restore Update Icon" \
+        "Puts the system update indicator back on the bar." \
+        "Restored update icon to bar" _update_present _update_restore
 }
 
 enable_rounded_corners() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Enable Rounded Corners${RESET}"
-    echo
-    echo -e "  ${DIM}Adds rounded corners to windows, menus, notifications,${RESET}"
-    echo -e "  ${DIM}and other UI elements (rounding = 8).${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$LOOKNFEEL_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  looknfeel.conf not found at $LOOKNFEEL_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Enable rounded corners -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if already enabled (uncommented rounding line)
-    if grep -q "^[[:space:]]*rounding = " "$LOOKNFEEL_CONF"; then
-        echo -e "  ${DIM}Rounded corners already enabled. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Enable rounded corners -- already enabled")
-        return 0
-    fi
-
-    # Check if commented rounding line exists
-    if ! grep -q "^[[:space:]]*#[[:space:]]*rounding = " "$LOOKNFEEL_CONF"; then
-        echo -e "  ${DIM}rounding setting not found in config. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Enable rounded corners -- setting not found")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Enable rounded corners -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${LOOKNFEEL_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$LOOKNFEEL_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Uncomment the rounding line
-    sed -i 's/^[[:space:]]*#[[:space:]]*\(rounding = .*\)/    \1/' "$LOOKNFEEL_CONF"
-
-    echo -e "  ${CHECKED}✓${RESET}  Hyprland windows — rounded"
-    SUMMARY_LOG+=("✓  Enabled rounded corners")
-
-    # Walker (launcher/menus)
-    local walker_css="$HOME/.local/share/omarchy/default/walker/themes/omarchy-default/style.css"
-    if [[ -f "$walker_css" ]]; then
-        if ! grep -q 'border-radius' "$walker_css"; then
-            sed -i '/\.box-wrapper {/,/}/ s/border: 2px solid @border;/border: 2px solid @border;\n  border-radius: 8px;/' "$walker_css"
-            echo -e "  ${CHECKED}✓${RESET}  Walker menus — rounded"
-        fi
-    fi
-
-    # SwayOSD (volume/brightness overlay)
-    local swayosd_css="$HOME/.config/swayosd/style.css"
-    if [[ -f "$swayosd_css" ]]; then
-        sed -i '/^window {/,/}/ s/border-radius: 0;/border-radius: 8px;/' "$swayosd_css"
-        sed -i '/^progressbar {/,/}/ s/border-radius: 0;/border-radius: 8px;/' "$swayosd_css"
-        echo -e "  ${CHECKED}✓${RESET}  SwayOSD overlay — rounded"
-    fi
-
-    # Hyprlock (lock screen password input)
-    local hyprlock_conf="$HOME/.config/hypr/hyprlock.conf"
-    if [[ -f "$hyprlock_conf" ]]; then
-        sed -i '/^input-field {/,/}/ s/rounding = 0/rounding = 8/' "$hyprlock_conf"
-        echo -e "  ${CHECKED}✓${RESET}  Hyprlock password field — rounded"
-    fi
-
-    # Mako (notifications)
-    local mako_ini="$HOME/.local/share/omarchy/default/mako/core.ini"
-    if [[ -f "$mako_ini" ]]; then
-        if ! grep -q 'border-radius' "$mako_ini"; then
-            sed -i '/^border-size=/a border-radius=8' "$mako_ini"
-            echo -e "  ${CHECKED}✓${RESET}  Mako notifications — rounded"
-        fi
-    fi
-
-    # Waybar tooltips (need both tooltip and tooltip * to override global * border-radius: 0)
-    if [[ -f "$WAYBAR_CONF_STYLE" ]]; then
-        if ! grep -q 'tooltip.*border-radius' "$WAYBAR_CONF_STYLE"; then
-            sed -i '/^tooltip {/,/}/ s/padding: 2px;/padding: 2px;\n  border-radius: 8px;/' "$WAYBAR_CONF_STYLE"
-        fi
-        if ! grep -q '^tooltip \*' "$WAYBAR_CONF_STYLE"; then
-            sed -i '/^tooltip {/,/^}/ { /^}/a\
-\
-tooltip * {\
-  border-radius: 8px;\
-}
-            }' "$WAYBAR_CONF_STYLE"
-        fi
-        echo -e "  ${CHECKED}✓${RESET}  Waybar tooltips — rounded"
-    fi
-
-    echo
-
-    # Restart services that need it
-    if command -v walker &>/dev/null && pgrep -x walker &>/dev/null; then
-        pkill -x walker 2>/dev/null
-    fi
-    if command -v makoctl &>/dev/null; then
-        makoctl reload 2>/dev/null
-    fi
-    if pgrep -x waybar &>/dev/null; then
-        pkill -x waybar && sleep 0.3 && uwsm app -- waybar &>/dev/null &
-    fi
-
-    echo -e "  ${DIM}Hyprland will auto-reload. Services restarted.${RESET}"
-    echo
+    apply_lua_block "Enable Rounded Corners" \
+        "Rounds windows (rounding = 8). The Omarchy shell (bar, menus, notifications, OSD, lock screen) follows Hyprland's rounding automatically." \
+        "$LOOKNFEEL_LUA" "rounded-corners" "Enabled rounded corners" \
+        'hl.config({ decoration = { rounding = 8 } })'
 }
 
 disable_rounded_corners() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Disable Rounded Corners${RESET}"
-    echo
-    echo -e "  ${DIM}Returns to sharp/square corners on windows, menus,${RESET}"
-    echo -e "  ${DIM}notifications, and other UI elements.${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$LOOKNFEEL_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  looknfeel.conf not found at $LOOKNFEEL_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Disable rounded corners -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if rounding is enabled (uncommented)
-    if ! grep -q "^[[:space:]]*rounding = " "$LOOKNFEEL_CONF"; then
-        echo -e "  ${DIM}Rounded corners already disabled. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Disable rounded corners -- already disabled")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Disable rounded corners -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${LOOKNFEEL_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$LOOKNFEEL_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Comment out the rounding line
-    sed -i 's/^[[:space:]]*\(rounding = .*\)/    # \1/' "$LOOKNFEEL_CONF"
-
-    echo -e "  ${CHECKED}✓${RESET}  Hyprland windows — square"
-    SUMMARY_LOG+=("✓  Disabled rounded corners")
-
-    # Walker (launcher/menus)
-    local walker_css="$HOME/.local/share/omarchy/default/walker/themes/omarchy-default/style.css"
-    if [[ -f "$walker_css" ]]; then
-        if grep -q 'border-radius' "$walker_css"; then
-            sed -i '/\.box-wrapper {/,/}/ { /border-radius/d; }' "$walker_css"
-            echo -e "  ${CHECKED}✓${RESET}  Walker menus — square"
-        fi
-    fi
-
-    # SwayOSD (volume/brightness overlay)
-    local swayosd_css="$HOME/.config/swayosd/style.css"
-    if [[ -f "$swayosd_css" ]]; then
-        sed -i '/^window {/,/}/ s/border-radius: 8px;/border-radius: 0;/' "$swayosd_css"
-        sed -i '/^progressbar {/,/}/ s/border-radius: 8px;/border-radius: 0;/' "$swayosd_css"
-        echo -e "  ${CHECKED}✓${RESET}  SwayOSD overlay — square"
-    fi
-
-    # Hyprlock (lock screen password input)
-    local hyprlock_conf="$HOME/.config/hypr/hyprlock.conf"
-    if [[ -f "$hyprlock_conf" ]]; then
-        sed -i '/^input-field {/,/}/ s/rounding = 8/rounding = 0/' "$hyprlock_conf"
-        echo -e "  ${CHECKED}✓${RESET}  Hyprlock password field — square"
-    fi
-
-    # Mako (notifications)
-    local mako_ini="$HOME/.local/share/omarchy/default/mako/core.ini"
-    if [[ -f "$mako_ini" ]]; then
-        if grep -q 'border-radius' "$mako_ini"; then
-            sed -i '/^border-radius=/d' "$mako_ini"
-            echo -e "  ${CHECKED}✓${RESET}  Mako notifications — square"
-        fi
-    fi
-
-    # Waybar tooltips (remove both tooltip border-radius and tooltip * block)
-    if [[ -f "$WAYBAR_CONF_STYLE" ]]; then
-        sed -i '/^tooltip {/,/}/ { /border-radius/d; }' "$WAYBAR_CONF_STYLE"
-        sed -i '/^tooltip \* {/,/^}/d' "$WAYBAR_CONF_STYLE"
-        echo -e "  ${CHECKED}✓${RESET}  Waybar tooltips — square"
-    fi
-
-    echo
-
-    # Restart services that need it
-    if command -v walker &>/dev/null && pgrep -x walker &>/dev/null; then
-        pkill -x walker 2>/dev/null
-    fi
-    if command -v makoctl &>/dev/null; then
-        makoctl reload 2>/dev/null
-    fi
-    if pgrep -x waybar &>/dev/null; then
-        pkill -x waybar && sleep 0.3 && uwsm app -- waybar &>/dev/null &
-    fi
-
-    echo -e "  ${DIM}Hyprland will auto-reload. Services restarted.${RESET}"
-    echo
+    apply_lua_block "Disable Rounded Corners" \
+        "Returns to Omarchy's square corners for windows and the shell UI." \
+        "$LOOKNFEEL_LUA" "rounded-corners" "Disabled rounded corners"
 }
 
 remove_window_gaps() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Remove Window Gaps${RESET}"
-    echo
-    echo -e "  ${DIM}Removes all gaps between windows and borders.${RESET}"
-    echo -e "  ${DIM}Maximizes screen space - great for laptops.${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$LOOKNFEEL_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  looknfeel.conf not found at $LOOKNFEEL_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Remove window gaps -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if already enabled (uncommented gaps_in line)
-    if grep -q "^[[:space:]]*gaps_in = 0" "$LOOKNFEEL_CONF"; then
-        echo -e "  ${DIM}Window gaps already removed. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Remove window gaps -- already removed")
-        return 0
-    fi
-
-    # Check if commented gaps lines exist
-    if ! grep -q "^[[:space:]]*#[[:space:]]*gaps_in = 0" "$LOOKNFEEL_CONF"; then
-        echo -e "  ${DIM}gaps settings not found in config. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Remove window gaps -- settings not found")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Remove window gaps -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${LOOKNFEEL_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$LOOKNFEEL_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Uncomment the gaps and border lines
-    sed -i 's/^[[:space:]]*#[[:space:]]*\(gaps_in = 0\)/    \1/' "$LOOKNFEEL_CONF"
-    sed -i 's/^[[:space:]]*#[[:space:]]*\(gaps_out = 0\)/    \1/' "$LOOKNFEEL_CONF"
-    sed -i 's/^[[:space:]]*#[[:space:]]*\(border_size = 0\)/    \1/' "$LOOKNFEEL_CONF"
-
-    echo -e "  ${CHECKED}✓${RESET}  Window gaps removed"
-    SUMMARY_LOG+=("✓  Removed window gaps")
-    echo
-    echo -e "  ${DIM}Hyprland will auto-reload the config.${RESET}"
-    echo
+    apply_lua_block "Remove Window Gaps" \
+        "Removes gaps and borders between tiled windows (gaps_in, gaps_out and border_size = 0)." \
+        "$LOOKNFEEL_LUA" "window-gaps" "Removed window gaps" \
+        'hl.config({ general = { gaps_in = 0, gaps_out = 0, border_size = 0 } })'
 }
 
 restore_window_gaps() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Restore Window Gaps${RESET}"
-    echo
-    echo -e "  ${DIM}Restores gaps between windows and borders (Omarchy default).${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$LOOKNFEEL_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  looknfeel.conf not found at $LOOKNFEEL_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Restore window gaps -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if gaps are removed (uncommented)
-    if ! grep -q "^[[:space:]]*gaps_in = 0" "$LOOKNFEEL_CONF"; then
-        echo -e "  ${DIM}Window gaps already restored. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Restore window gaps -- already restored")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Restore window gaps -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${LOOKNFEEL_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$LOOKNFEEL_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Comment out the gaps and border lines
-    sed -i 's/^[[:space:]]*\(gaps_in = 0\)/    # \1/' "$LOOKNFEEL_CONF"
-    sed -i 's/^[[:space:]]*\(gaps_out = 0\)/    # \1/' "$LOOKNFEEL_CONF"
-    sed -i 's/^[[:space:]]*\(border_size = 0\)/    # \1/' "$LOOKNFEEL_CONF"
-
-    echo -e "  ${CHECKED}✓${RESET}  Window gaps restored"
-    SUMMARY_LOG+=("✓  Restored window gaps")
-    echo
-    echo -e "  ${DIM}Hyprland will auto-reload the config.${RESET}"
-    echo
+    apply_lua_block "Restore Window Gaps" \
+        "Restores Omarchy's default gaps and borders between windows." \
+        "$LOOKNFEEL_LUA" "window-gaps" "Restored window gaps"
 }
 
 remove_transparency() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Remove Transparency${RESET}"
-    echo
-    echo -e "  ${DIM}Removes all opacity/transparency effects from windows${RESET}"
-    echo -e "  ${DIM}and menus. Everything will be fully opaque.${RESET}"
-    echo
-    echo
-
-    local missing=false
-    if [[ ! -f "$WINDOWS_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  windows.conf not found at $WINDOWS_CONF"
-        missing=true
-    fi
-    if [[ ! -f "$BROWSER_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  browser.conf not found at $BROWSER_CONF"
-        missing=true
-    fi
-    if [[ "$missing" = true ]]; then
-        echo
-        SUMMARY_LOG+=("✗  Remove transparency -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if already removed (commented out)
-    local walker_css="$HOME/.local/share/omarchy/default/walker/themes/omarchy-default/style.css"
-    if ! grep -q "^windowrule = opacity 0.97 0.9, match:class \.\*" "$WINDOWS_CONF" && \
-       ! grep -q "^windowrule = opacity 1 0.97, match:tag chromium-based-browser" "$BROWSER_CONF"; then
-        echo -e "  ${DIM}Transparency already removed. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Remove transparency -- already removed")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Remove transparency -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backups
-    local backup_win="${WINDOWS_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$WINDOWS_CONF" "$backup_win"
-    echo -e "  ${DIM}Backup: $backup_win${RESET}"
-
-    local backup_browser="${BROWSER_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$BROWSER_CONF" "$backup_browser"
-    echo -e "  ${DIM}Backup: $backup_browser${RESET}"
-
-    # Comment out opacity window rules
-    sed -i 's/^windowrule = opacity 0.97 0.9, match:class \.\*/# &/' "$WINDOWS_CONF"
-    sed -i 's/^windowrule = opacity 1 0.97, match:tag chromium-based-browser/# &/' "$BROWSER_CONF"
-    sed -i 's/^windowrule = opacity 1 0.97, match:tag firefox-based-browser/# &/' "$BROWSER_CONF"
-
-    echo -e "  ${CHECKED}✓${RESET}  Hyprland windows — opaque"
-
-    # Walker menu background: alpha(@base, 0.95) -> @base
-    if [[ -f "$walker_css" ]]; then
-        if grep -q 'alpha(@base, 0\.95)' "$walker_css"; then
-            local backup_walker="${walker_css}.backup.$(date +%Y%m%d_%H%M%S)"
-            cp "$walker_css" "$backup_walker"
-            echo -e "  ${DIM}Backup: $backup_walker${RESET}"
-            sed -i '/\.box-wrapper {/,/}/ s/background: alpha(@base, 0\.95);/background: @base;/' "$walker_css"
-            echo -e "  ${CHECKED}✓${RESET}  Walker menus — opaque"
-        fi
-    fi
-
-    SUMMARY_LOG+=("✓  Removed transparency")
-    echo
-
-    # Restart walker if running
-    if command -v walker &>/dev/null && pgrep -x walker &>/dev/null; then
-        pkill -x walker 2>/dev/null
-    fi
-
-    echo -e "  ${DIM}Hyprland will auto-reload the config.${RESET}"
-    echo
+    apply_lua_block "Remove Transparency" \
+        "Makes all windows fully opaque, overriding Omarchy's default and browser opacity rules." \
+        "$LOOKNFEEL_LUA" "transparency" "Removed transparency" \
+        'o.window(".*", { opacity = "1.0 override 1.0 override" })'
 }
 
 restore_transparency() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Restore Transparency${RESET}"
-    echo
-    echo -e "  ${DIM}Restores default opacity/transparency effects.${RESET}"
-    echo -e "  ${DIM}Active: 0.97, inactive: 0.9, browsers: 1.0/0.97, menus: 0.95.${RESET}"
-    echo
-    echo
-
-    local missing=false
-    if [[ ! -f "$WINDOWS_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  windows.conf not found at $WINDOWS_CONF"
-        missing=true
-    fi
-    if [[ ! -f "$BROWSER_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  browser.conf not found at $BROWSER_CONF"
-        missing=true
-    fi
-    if [[ "$missing" = true ]]; then
-        echo
-        SUMMARY_LOG+=("✗  Restore transparency -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if transparency is already active (uncommented)
-    local walker_css="$HOME/.local/share/omarchy/default/walker/themes/omarchy-default/style.css"
-    if grep -q "^windowrule = opacity 0.97 0.9, match:class \.\*" "$WINDOWS_CONF" && \
-       grep -q "^windowrule = opacity 1 0.97, match:tag chromium-based-browser" "$BROWSER_CONF"; then
-        echo -e "  ${DIM}Transparency already restored. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Restore transparency -- already restored")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Restore transparency -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backups
-    local backup_win="${WINDOWS_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$WINDOWS_CONF" "$backup_win"
-    echo -e "  ${DIM}Backup: $backup_win${RESET}"
-
-    local backup_browser="${BROWSER_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$BROWSER_CONF" "$backup_browser"
-    echo -e "  ${DIM}Backup: $backup_browser${RESET}"
-
-    # Uncomment opacity window rules
-    sed -i 's/^# \(windowrule = opacity 0.97 0.9, match:class \.\*\)/\1/' "$WINDOWS_CONF"
-    sed -i 's/^# \(windowrule = opacity 1 0.97, match:tag chromium-based-browser\)/\1/' "$BROWSER_CONF"
-    sed -i 's/^# \(windowrule = opacity 1 0.97, match:tag firefox-based-browser\)/\1/' "$BROWSER_CONF"
-
-    echo -e "  ${CHECKED}✓${RESET}  Hyprland windows — transparent"
-
-    # Walker menu background: @base -> alpha(@base, 0.95)
-    if [[ -f "$walker_css" ]]; then
-        if grep -q '\.box-wrapper' "$walker_css" && \
-           ! grep -q 'alpha(@base, 0\.95)' "$walker_css"; then
-            local backup_walker="${walker_css}.backup.$(date +%Y%m%d_%H%M%S)"
-            cp "$walker_css" "$backup_walker"
-            echo -e "  ${DIM}Backup: $backup_walker${RESET}"
-            sed -i '/\.box-wrapper {/,/}/ s/background: @base;/background: alpha(@base, 0.95);/' "$walker_css"
-            echo -e "  ${CHECKED}✓${RESET}  Walker menus — transparent"
-        fi
-    fi
-
-    SUMMARY_LOG+=("✓  Restored transparency")
-    echo
-
-    # Restart walker if running
-    if command -v walker &>/dev/null && pgrep -x walker &>/dev/null; then
-        pkill -x walker 2>/dev/null
-    fi
-
-    echo -e "  ${DIM}Hyprland will auto-reload the config.${RESET}"
-    echo
+    apply_lua_block "Restore Transparency" \
+        "Restores Omarchy's default window opacity." \
+        "$LOOKNFEEL_LUA" "transparency" "Restored transparency"
 }
 
-enable_12h_clock() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Enable 12-Hour Clock${RESET}"
-    echo
-    echo -e "  ${DIM}Changes the waybar clock to 12-hour format with AM/PM.${RESET}"
-    echo -e "  ${DIM}Example: \"Sunday 10:55 AM\"${RESET}"
-    echo
-    echo
 
-    if [[ ! -f "$WAYBAR_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  waybar config not found at $WAYBAR_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Enable 12h clock -- failed (config not found)")
-        return 1
-    fi
 
-    # Check if already using 12-hour format
-    if grep -q '%I:%M %p' "$WAYBAR_CONF"; then
-        echo -e "  ${DIM}Already using 12-hour clock. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Enable 12h clock -- already set")
-        return 0
-    fi
-
-    # Check if 24-hour format exists
-    if ! grep -q '%H:%M' "$WAYBAR_CONF"; then
-        echo -e "  ${DIM}24-hour clock format not found. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Enable 12h clock -- 24h format not found")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Enable 12h clock -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${WAYBAR_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$WAYBAR_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Replace 24-hour format with 12-hour format
-    sed -i 's/%H:%M/%I:%M %p/g' "$WAYBAR_CONF"
-
-    # Restart waybar to apply
-    if command -v omarchy-restart-waybar &>/dev/null; then
-        omarchy-restart-waybar &>/dev/null || true
-    fi
-
-    echo -e "  ${CHECKED}✓${RESET}  12-hour clock enabled"
-    SUMMARY_LOG+=("✓  Enabled 12-hour clock")
-    echo
-}
-
-disable_12h_clock() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Disable 12-Hour Clock${RESET}"
-    echo
-    echo -e "  ${DIM}Changes the waybar clock back to 24-hour format.${RESET}"
-    echo -e "  ${DIM}Example: \"Sunday 22:55\"${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$WAYBAR_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  waybar config not found at $WAYBAR_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Disable 12h clock -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if using 12-hour format
-    if ! grep -q '%I:%M %p' "$WAYBAR_CONF"; then
-        echo -e "  ${DIM}Already using 24-hour clock. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Disable 12h clock -- already set")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Disable 12h clock -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${WAYBAR_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$WAYBAR_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Replace 12-hour format with 24-hour format
-    sed -i 's/%I:%M %p/%H:%M/g' "$WAYBAR_CONF"
-
-    # Restart waybar to apply
-    if command -v omarchy-restart-waybar &>/dev/null; then
-        omarchy-restart-waybar &>/dev/null || true
-    fi
-
-    echo -e "  ${CHECKED}✓${RESET}  24-hour clock restored"
-    SUMMARY_LOG+=("✓  Restored 24-hour clock")
-    echo
-}
+_title_present() { shell_bar_has omarchy.active-window; }
+_title_add() { omarchy-bar put omarchy.active-window --after omarchy.workspaces &>/dev/null; }
+_title_absent() { ! shell_bar_has omarchy.active-window; }
+_title_remove() { shell_bar_remove omarchy.active-window; }
 
 show_window_title() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Show Window Title${RESET}"
-    echo
-    echo -e "  ${DIM}Displays the active window name on the waybar next to workspaces.${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$WAYBAR_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  waybar config not found at $WAYBAR_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Show window title -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if already enabled
-    if grep -q 'hyprland/window' "$WAYBAR_CONF"; then
-        echo -e "  ${DIM}Window title is already shown. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Show window title -- already set")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Show window title -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${WAYBAR_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$WAYBAR_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Add hyprland/window to modules-left after workspaces
-    sed -i 's/"hyprland\/workspaces"\]/"hyprland\/workspaces", "hyprland\/window"]/' "$WAYBAR_CONF"
-
-    # Add hyprland/window config block before the closing brace
-    sed -i '/^}$/i\  ,"hyprland/window": {\n    "format": "{}",\n    "max-length": 40,\n    "tooltip": false\n  }' "$WAYBAR_CONF"
-
-    # Restart waybar to apply
-    if command -v omarchy-restart-waybar &>/dev/null; then
-        omarchy-restart-waybar &>/dev/null || true
-    fi
-
-    echo -e "  ${CHECKED}✓${RESET}  Window title shown"
-    SUMMARY_LOG+=("✓  Showing window title")
-    echo
+    apply_shell_change "Show Window Title" \
+        "Shows the focused window's title on the bar next to the workspaces." \
+        "Window title shown on bar" _title_present _title_add
 }
 
 hide_window_title() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Hide Window Title${RESET}"
-    echo
-    echo -e "  ${DIM}Removes the active window name from the waybar.${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$WAYBAR_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  waybar config not found at $WAYBAR_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Hide window title -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if already hidden
-    if ! grep -q 'hyprland/window' "$WAYBAR_CONF"; then
-        echo -e "  ${DIM}Window title is already hidden. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Hide window title -- already set")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Hide window title -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${WAYBAR_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$WAYBAR_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Remove hyprland/window from modules-left
-    sed -i 's/, "hyprland\/window"//' "$WAYBAR_CONF"
-
-    # Remove hyprland/window config block
-    sed -i '/"hyprland\/window"/,/^  }/d' "$WAYBAR_CONF"
-
-    # Clean up any trailing comma left before closing brace
-    sed -i -z 's/,\n}/\n}/' "$WAYBAR_CONF"
-
-    # Restart waybar to apply
-    if command -v omarchy-restart-waybar &>/dev/null; then
-        omarchy-restart-waybar &>/dev/null || true
-    fi
-
-    echo -e "  ${CHECKED}✓${RESET}  Window title hidden"
-    SUMMARY_LOG+=("✓  Hidden window title")
-    echo
+    apply_shell_change "Hide Window Title" \
+        "Removes the focused window's title from the bar." \
+        "Window title hidden from bar" _title_absent _title_remove
 }
 
+# Clock format as stored in shell.json (Qt date format), with the widget default
+clock_format() {
+    local f
+    f=$(shell_bar_get omarchy.clock format)
+    echo "${f:-dddd HH:mm}"
+}
+
+_clock_set_format() { omarchy-bar set omarchy.clock format "$1" &>/dev/null; }
+
+_date_shown() { [[ "$(clock_format)" == *dddd* ]]; }
+_date_show() { _clock_set_format "dddd $(clock_format)"; }
+_date_hidden() { [[ "$(clock_format)" != *dddd* ]]; }
+_date_hide() { local f; f="$(clock_format)"; f="${f//dddd /}"; _clock_set_format "${f//dddd/}"; }
+
 show_clock_date() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Show Clock Date${RESET}"
-    echo
-    echo -e "  ${DIM}Adds the day name to the waybar clock.${RESET}"
-    echo -e "  ${DIM}Example: \"Sunday 10:55 AM\" or \"Sunday 22:55\"${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$WAYBAR_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  waybar config not found at $WAYBAR_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Show clock date -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if date is already shown (look for %A in the clock format line)
-    if grep -q '"format":.*%A' "$WAYBAR_CONF"; then
-        echo -e "  ${DIM}Clock date is already visible. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Show clock date -- already set")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Show clock date -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${WAYBAR_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$WAYBAR_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Add %A before the time format (handles both 12h and 24h)
-    sed -i 's/{:L%H:%M/{:L%A %H:%M/g; s/{:L%I:%M/{:L%A %I:%M/g' "$WAYBAR_CONF"
-
-    # Restart waybar to apply
-    if command -v omarchy-restart-waybar &>/dev/null; then
-        omarchy-restart-waybar &>/dev/null || true
-    fi
-
-    echo -e "  ${CHECKED}✓${RESET}  Clock date shown"
-    SUMMARY_LOG+=("✓  Showing clock date")
-    echo
+    apply_shell_change "Show Clock Day" \
+        "Shows the day name on the bar clock (e.g. Monday 14:30)." \
+        "Clock day name shown" _date_shown _date_show
 }
 
 hide_clock_date() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Hide Clock Date${RESET}"
-    echo
-    echo -e "  ${DIM}Removes the day name from the waybar clock.${RESET}"
-    echo -e "  ${DIM}Example: \"10:55 AM\" or \"22:55\"${RESET}"
-    echo
-    echo
+    apply_shell_change "Hide Clock Day" \
+        "Hides the day name on the bar clock (e.g. 14:30)." \
+        "Clock day name hidden" _date_hidden _date_hide
+}
 
-    if [[ ! -f "$WAYBAR_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  waybar config not found at $WAYBAR_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Hide clock date -- failed (config not found)")
-        return 1
-    fi
+_clock_is_12h() { [[ "$(clock_format)" == *AP* || "$(clock_format)" == *ap* ]]; }
+_clock_to_12h() { local f; f="$(clock_format)"; _clock_set_format "${f/HH:mm/h:mm AP}"; }
+_clock_is_24h() { ! _clock_is_12h; }
+_clock_to_24h() { local f; f="$(clock_format)"; f="${f/h:mm AP/HH:mm}"; _clock_set_format "${f/h:mm ap/HH:mm}"; }
 
-    # Check if date is already hidden
-    if ! grep -q '"format":.*%A' "$WAYBAR_CONF"; then
-        echo -e "  ${DIM}Clock date is already hidden. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Hide clock date -- already set")
-        return 0
-    fi
+enable_12h_clock() {
+    apply_shell_change "12-Hour Clock" \
+        "Shows the bar clock in 12-hour format (e.g. 2:30 PM)." \
+        "Clock set to 12-hour" _clock_is_12h _clock_to_12h
+}
 
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
+disable_12h_clock() {
+    apply_shell_change "24-Hour Clock" \
+        "Shows the bar clock in 24-hour format (e.g. 14:30)." \
+        "Clock set to 24-hour" _clock_is_24h _clock_to_24h
+}
 
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Hide clock date -- cancelled")
-        return 0
-    fi
+MEDIA_DIRS_MARKER_START="# >>> a-la-carchy media-dirs"
+MEDIA_DIRS_MARKER_END="# <<< a-la-carchy media-dirs"
 
-    echo
-
-    # Create backup
-    local backup_file="${WAYBAR_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$WAYBAR_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Remove %A and trailing space from the clock format
-    sed -i 's/%A //g' "$WAYBAR_CONF"
-
-    # Restart waybar to apply
-    if command -v omarchy-restart-waybar &>/dev/null; then
-        omarchy-restart-waybar &>/dev/null || true
-    fi
-
-    echo -e "  ${CHECKED}✓${RESET}  Clock date hidden"
-    SUMMARY_LOG+=("✓  Hidden clock date")
-    echo
+_media_dirs_remove() {
+    [[ -f "$UWSM_DEFAULT" ]] || return 0
+    awk -v s="$MEDIA_DIRS_MARKER_START" -v e="$MEDIA_DIRS_MARKER_END" '
+        $0 == s { skip = 1; next }
+        $0 == e { skip = 0; next }
+        !skip { print }
+    ' "$UWSM_DEFAULT" > "${UWSM_DEFAULT}.tmp" && mv "${UWSM_DEFAULT}.tmp" "$UWSM_DEFAULT"
 }
 
 enable_media_directories() {
     clear
     echo
     echo
-    echo -e "${BOLD}  Enable Screenshot/Recording Directories${RESET}"
+    echo -e "${BOLD}  Enable Media Directories${RESET}"
     echo
-    echo -e "  ${DIM}Saves screenshots and recordings to dedicated folders:${RESET}"
-    echo -e "  ${DIM}  • Screenshots → ~/Pictures/Screenshots${RESET}"
-    echo -e "  ${DIM}  • Recordings → ~/Videos/Screencasts${RESET}"
-    echo
-    echo -e "  ${DIM}Note: Requires Omarchy restart to take effect.${RESET}"
+    echo -e "  ${DIM}Saves screenshots to ~/Pictures/Screenshots and recordings to ~/Videos/Screencasts.${RESET}"
+    echo -e "  ${DIM}Written to ~/.config/uwsm/default; takes effect after the next login.${RESET}"
     echo
     echo
 
-    if [[ ! -f "$UWSM_DEFAULT" ]]; then
-        echo -e "  ${DIM}✗${RESET}  uwsm default config not found at $UWSM_DEFAULT"
-        echo
-        SUMMARY_LOG+=("✗  Enable media directories -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if already enabled (uncommented lines)
-    if grep -q '^export OMARCHY_SCREENSHOT_DIR=' "$UWSM_DEFAULT"; then
-        echo -e "  ${DIM}Media directories already enabled. Nothing to do.${RESET}"
+    if [[ -f "$UWSM_DEFAULT" ]] && grep -qxF "$MEDIA_DIRS_MARKER_START" "$UWSM_DEFAULT"; then
+        echo -e "  ${DIM}Already enabled. Nothing to do.${RESET}"
         echo
         SUMMARY_LOG+=("--  Enable media directories -- already enabled")
         return 0
     fi
 
-    # Check if commented lines exist
-    if ! grep -q '^#.*export OMARCHY_SCREENSHOT_DIR=' "$UWSM_DEFAULT"; then
-        echo -e "  ${DIM}Screenshot directory setting not found. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Enable media directories -- settings not found")
-        return 0
-    fi
+    confirm_continue "Enable media directories" || return 0
 
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
+    mkdir -p "$HOME/Pictures/Screenshots" "$HOME/Videos/Screencasts" "$(dirname "$UWSM_DEFAULT")"
+    [[ -f "$UWSM_DEFAULT" ]] && backup_file "$UWSM_DEFAULT"
+    {
+        echo "$MEDIA_DIRS_MARKER_START"
+        echo 'export OMARCHY_SCREENSHOT_DIR="$HOME/Pictures/Screenshots"'
+        echo 'export OMARCHY_SCREENRECORD_DIR="$HOME/Videos/Screencasts"'
+        echo "$MEDIA_DIRS_MARKER_END"
+    } >> "$UWSM_DEFAULT"
 
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Enable media directories -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    # Create backup
-    local backup_file="${UWSM_DEFAULT}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$UWSM_DEFAULT" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Create the directories
-    mkdir -p "$HOME/Pictures/Screenshots"
-    mkdir -p "$HOME/Videos/Screencasts"
-    echo -e "  ${DIM}Created ~/Pictures/Screenshots${RESET}"
-    echo -e "  ${DIM}Created ~/Videos/Screencasts${RESET}"
-
-    # Uncomment the export lines
-    sed -i 's/^# *\(export OMARCHY_SCREENSHOT_DIR=.*\)/\1/' "$UWSM_DEFAULT"
-    sed -i 's/^# *\(export OMARCHY_SCREENRECORD_DIR=.*\)/\1/' "$UWSM_DEFAULT"
-
-    echo -e "  ${CHECKED}✓${RESET}  Media directories enabled"
+    echo -e "  ${CHECKED}✓${RESET}  Media directories enabled (log out and back in to apply)"
     SUMMARY_LOG+=("✓  Enabled screenshot/recording directories")
-    echo
-    echo -e "  ${DIM}Restart Omarchy for changes to take effect.${RESET}"
     echo
 }
 
@@ -7566,160 +5846,103 @@ disable_media_directories() {
     clear
     echo
     echo
-    echo -e "${BOLD}  Disable Screenshot/Recording Directories${RESET}"
+    echo -e "${BOLD}  Disable Media Directories${RESET}"
     echo
-    echo -e "  ${DIM}Returns to default behavior (saves to ~/Pictures and ~/Videos).${RESET}"
-    echo
-    echo -e "  ${DIM}Note: Requires Omarchy restart to take effect.${RESET}"
+    echo -e "  ${DIM}Screenshots and recordings go back to ~/Pictures and ~/Videos (Omarchy default).${RESET}"
     echo
     echo
 
-    if [[ ! -f "$UWSM_DEFAULT" ]]; then
-        echo -e "  ${DIM}✗${RESET}  uwsm default config not found at $UWSM_DEFAULT"
+    if [[ ! -f "$UWSM_DEFAULT" ]] || ! grep -qxF "$MEDIA_DIRS_MARKER_START" "$UWSM_DEFAULT"; then
+        echo -e "  ${DIM}Not enabled. Nothing to do.${RESET}"
         echo
-        SUMMARY_LOG+=("✗  Disable media directories -- failed (config not found)")
-        return 1
-    fi
-
-    # Check if enabled (uncommented lines)
-    if ! grep -q '^export OMARCHY_SCREENSHOT_DIR=' "$UWSM_DEFAULT"; then
-        echo -e "  ${DIM}Media directories already disabled. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Disable media directories -- already disabled")
+        SUMMARY_LOG+=("--  Disable media directories -- not enabled")
         return 0
     fi
 
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
+    confirm_continue "Disable media directories" || return 0
 
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Disable media directories -- cancelled")
-        return 0
-    fi
+    backup_file "$UWSM_DEFAULT"
+    _media_dirs_remove
+    # The override file is optional; drop it if only our block was in it
+    [[ -s "$UWSM_DEFAULT" ]] || rm -f "$UWSM_DEFAULT"
 
-    echo
-
-    # Create backup
-    local backup_file="${UWSM_DEFAULT}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$UWSM_DEFAULT" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    # Comment out the export lines
-    sed -i 's/^\(export OMARCHY_SCREENSHOT_DIR=.*\)/# \1/' "$UWSM_DEFAULT"
-    sed -i 's/^\(export OMARCHY_SCREENRECORD_DIR=.*\)/# \1/' "$UWSM_DEFAULT"
-
-    echo -e "  ${CHECKED}✓${RESET}  Media directories disabled"
+    echo -e "  ${CHECKED}✓${RESET}  Media directories disabled (log out and back in to apply)"
     SUMMARY_LOG+=("✓  Disabled screenshot/recording directories")
     echo
-    echo -e "  ${DIM}Restart Omarchy for changes to take effect.${RESET}"
-    echo
+}
+
+# Command the Omarchy menu entry runs: this checkout when run from a file,
+# otherwise the published script
+alc_launch_command() {
+    local self
+    self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)"
+    if [[ -f "$self" && "$self" != /dev/* && "$self" != /proc/* ]]; then
+        echo "omarchy-launch-tui --app-id=org.omarchy.a-la-carchy $self"
+    else
+        echo "omarchy-launch-tui --app-id=org.omarchy.a-la-carchy bash -c 'bash <(curl -fsSL $ALC_SCRIPT_URL)'"
+    fi
+}
+
+
+_menu_entry_remove() {
+    [[ -f "$MENU_JSONC" ]] || return 0
+    awk -v s="$MENU_MARKER_START" -v e="$MENU_MARKER_END" '
+        $0 == s { skip = 1; next }
+        $0 == e { skip = 0; next }
+        !skip { print }
+    ' "$MENU_JSONC" > "${MENU_JSONC}.tmp" && mv "${MENU_JSONC}.tmp" "$MENU_JSONC"
 }
 
 add_to_omarchy_menu() {
+    echo
     echo -e "  ${BOLD}Adding A La Carchy to Omarchy menu...${RESET}"
-    echo
 
-    local ext_dir="$HOME/.config/omarchy/extensions"
-    local ext_file="$ext_dir/menu.sh"
-    local marker_start="# === a-la-carchy menu entry ==="
-    local marker_end="# === end a-la-carchy menu entry ==="
-    local menu_script="$HOME/.local/share/omarchy/bin/omarchy-menu"
+    mkdir -p "$(dirname "$MENU_JSONC")"
+    [[ -f "$MENU_JSONC" ]] || printf '{\n}\n' > "$MENU_JSONC"
+    backup_file "$MENU_JSONC"
+    _menu_entry_remove
 
-    if [ ! -f "$menu_script" ]; then
-        echo -e "  ${DIM}Omarchy menu script not found. Cannot add shortcut.${RESET}"
-        echo
-        SUMMARY_LOG+=("✗  Add menu shortcut -- omarchy-menu not found")
+    # Root-level entry, inserted right after the opening brace so it is always
+    # followed by valid JSONC (the menu parser drops trailing commas)
+    local action entry
+    action="$(alc_launch_command)"
+    entry=$(jq -cn --arg action "$action" \
+        '{icon: "󰒓", label: "A La Carchy", aliases: ["carchy"], description: "Omarchy debloater and optimizer", action: $action}')
+
+    ALC_LINE="  \"alacarchy\": $entry," awk -v s="$MENU_MARKER_START" -v e="$MENU_MARKER_END" '
+        !done && /^[[:space:]]*\{[[:space:]]*$/ { print; print s; print ENVIRON["ALC_LINE"]; print e; done = 1; next }
+        { print }
+    ' "$MENU_JSONC" > "${MENU_JSONC}.tmp" && mv "${MENU_JSONC}.tmp" "$MENU_JSONC"
+
+    if grep -qxF -- "$MENU_MARKER_START" "$MENU_JSONC"; then
+        omarchy-menu refresh &>/dev/null || true
+        echo -e "  ${CHECKED}✓${RESET}  A La Carchy added to the Omarchy menu"
+        SUMMARY_LOG+=("✓  Add menu shortcut -- added A La Carchy to Omarchy menu")
+    else
+        echo -e "  ${DIM}✗${RESET}  Could not find the menu's opening brace in $MENU_JSONC"
+        SUMMARY_LOG+=("✗  Add menu shortcut -- could not edit $MENU_JSONC")
         return 1
     fi
-
-    mkdir -p "$ext_dir"
-
-    # Remove existing managed block if present
-    if [ -f "$ext_file" ]; then
-        awk -v start="$marker_start" -v end="$marker_end" '
-            $0 == start { skip=1; next }
-            $0 == end   { skip=0; next }
-            !skip
-        ' "$ext_file" > "${ext_file}.tmp" && mv "${ext_file}.tmp" "$ext_file"
-    fi
-
-    # Extract the original show_main_menu line from omarchy-menu and inject A La Carchy
-    # The menu string looks like: "...\n  About\n  System"
-    # We insert "  A La Carchy\n" before the System entry
-    local original_menu_line
-    original_menu_line=$(grep -m1 'go_to_menu "$(menu "Go"' "$menu_script")
-    if [ -z "$original_menu_line" ]; then
-        echo -e "  ${DIM}Could not parse menu entries from omarchy-menu.${RESET}"
-        echo
-        SUMMARY_LOG+=("✗  Add menu shortcut -- could not parse menu")
-        return 1
-    fi
-
-    # Insert "  A La Carchy\n" before the last entry (System), preserving its icon
-    local modified_menu_line
-    modified_menu_line=$(echo "$original_menu_line" | sed 's|\\n\([^\\]*System\)|\\n  A La Carchy\\n\1|')
-
-    # Extract case entries from the original go_to_menu function
-    local case_entries
-    case_entries=$(sed -n '/^go_to_menu()/,/^}/p' "$menu_script" | sed -n '/^  \*/p')
-
-    # Build the extension file content
-    {
-        echo "$marker_start"
-        echo "show_main_menu() {"
-        echo "$modified_menu_line"
-        echo "}"
-        echo ""
-        echo "_ala_carchy_go_to_menu() {"
-        echo "  case \"\${1,,}\" in"
-        echo "  *carchy*) terminal bash -c \"bash <(curl -fsSL https://raw.githubusercontent.com/DanielCoffey1/a-la-carchy/master/a-la-carchy.sh)\" ;;"
-        echo "$case_entries"
-        echo "  esac"
-        echo "}"
-        echo "go_to_menu() { _ala_carchy_go_to_menu \"\$@\"; }"
-        echo "$marker_end"
-    } >> "$ext_file"
-
-    echo -e "  ${DIM}Created: $ext_file${RESET}"
     echo
-    SUMMARY_LOG+=("✓  Add menu shortcut -- added A La Carchy to Omarchy menu")
 }
 
 remove_from_omarchy_menu() {
-    echo -e "  ${BOLD}Removing A La Carchy from Omarchy menu...${RESET}"
     echo
+    echo -e "  ${BOLD}Removing A La Carchy from Omarchy menu...${RESET}"
 
-    local ext_file="$HOME/.config/omarchy/extensions/menu.sh"
-    local marker_start="# === a-la-carchy menu entry ==="
-    local marker_end="# === end a-la-carchy menu entry ==="
-
-    if [ ! -f "$ext_file" ]; then
-        echo -e "  ${DIM}Menu shortcut not found. Nothing to do.${RESET}"
-        echo
+    if [[ ! -f "$MENU_JSONC" ]] || ! grep -qxF -- "$MENU_MARKER_START" "$MENU_JSONC"; then
+        echo -e "  ${DIM}Not in the menu. Nothing to do.${RESET}"
         SUMMARY_LOG+=("--  Remove menu shortcut -- not found")
         return 0
     fi
 
-    awk -v start="$marker_start" -v end="$marker_end" '
-        $0 == start { skip=1; next }
-        $0 == end   { skip=0; next }
-        !skip
-    ' "$ext_file" > "${ext_file}.tmp" && mv "${ext_file}.tmp" "$ext_file"
+    backup_file "$MENU_JSONC"
+    _menu_entry_remove
+    omarchy-menu refresh &>/dev/null || true
 
-    # Delete file if empty
-    if [ ! -s "$ext_file" ]; then
-        rm -f "$ext_file"
-        echo -e "  ${DIM}Removed: $ext_file${RESET}"
-    else
-        echo -e "  ${DIM}Removed A La Carchy block from: $ext_file${RESET}"
-    fi
-    echo
+    echo -e "  ${CHECKED}✓${RESET}  A La Carchy removed from the Omarchy menu"
     SUMMARY_LOG+=("✓  Remove menu shortcut -- removed A La Carchy from Omarchy menu")
+    echo
 }
 
 # =============================================================================
@@ -7737,7 +5960,7 @@ write_themarchy_script() {
 
 THEMARCHY_DIR="$HOME/.config/omarchy/themes/themarchy"
 
-WALLPAPER=$(readlink -f "$HOME/.config/omarchy/current/background" 2>/dev/null)
+WALLPAPER=$(readlink -f "$HOME/.local/state/omarchy/current/background" 2>/dev/null)
 if [[ -z "$WALLPAPER" || ! -f "$WALLPAPER" ]]; then
     WALLPAPER=$(pgrep -a swaybg 2>/dev/null | grep -oP '(?<=-i )\S+' | head -1)
 fi
@@ -7861,7 +6084,7 @@ FASTFETCH_EOF
 
 # Copy the current wallpaper into the themarchy theme BEFORE the theme swap,
 # so omarchy-theme-bg-next finds it after current/theme is replaced.
-WALLPAPER_REAL=$(readlink -f "$HOME/.config/omarchy/current/background" 2>/dev/null)
+WALLPAPER_REAL=$(readlink -f "$HOME/.local/state/omarchy/current/background" 2>/dev/null)
 [[ -z "$WALLPAPER_REAL" || ! -f "$WALLPAPER_REAL" ]] && WALLPAPER_REAL="$WALLPAPER"
 if [[ -n "$WALLPAPER_REAL" && -f "$WALLPAPER_REAL" ]]; then
     WALLPAPER_EXT="${WALLPAPER_REAL##*.}"
@@ -7934,7 +6157,7 @@ show_themarchy_preview_dialog() {
     echo
 
     local wallpaper
-    wallpaper=$(readlink -f "$HOME/.config/omarchy/current/background" 2>/dev/null)
+    wallpaper=$(readlink -f "$HOME/.local/state/omarchy/current/background" 2>/dev/null)
     if [[ -z "$wallpaper" || ! -f "$wallpaper" ]]; then
         wallpaper=$(pgrep -a swaybg 2>/dev/null | grep -oP '(?<=-i )\S+' | head -1)
     fi
@@ -7987,7 +6210,7 @@ show_themarchy_preview_dialog() {
     done <<< "$colors"
     echo
     echo
-    echo -e "  ${DIM}Generates a full system theme (terminals, waybar, Walker, mako,${RESET}"
+    echo -e "  ${DIM}Generates a full system theme (terminals, bar, menus, notifications,${RESET}"
     echo -e "  ${DIM}Hyprland borders) tuned to these colors. Previous theme survives${RESET}"
     echo -e "  ${DIM}in Extra Themes and can be re-applied at any time.${RESET}"
     echo
@@ -8025,115 +6248,25 @@ apply_themarchy_now() {
 }
 
 setup_themarchy_keybind() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Enable Themarchy Keybind (SUPER+SHIFT+T)${RESET}"
-    echo
-    echo -e "  ${DIM}Deploys themarchy.sh and binds SUPER+SHIFT+T to apply${RESET}"
-    echo -e "  ${DIM}theme from current wallpaper instantly.${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$BINDINGS_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  bindings.conf not found at $BINDINGS_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Themarchy keybind -- failed (config not found)")
-        return 1
-    fi
-
-    if grep -q "SUPER SHIFT, T, Themarchy" "$BINDINGS_CONF"; then
-        echo -e "  ${DIM}Already bound. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Themarchy keybind -- already set")
-        return 0
-    fi
-
     if ! ensure_pywal_installed; then
         SUMMARY_LOG+=("✗  Themarchy keybind -- failed (python-pywal not installed)")
         return 1
     fi
 
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Themarchy keybind -- cancelled")
-        return 0
-    fi
-
-    echo
-
+    # Always redeploy so the bound script is current
     write_themarchy_script
-    echo -e "  ${DIM}✓${RESET}  Script deployed: $THEMARCHY_SCRIPT"
 
-    local backup_file="${BINDINGS_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$BINDINGS_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    echo "" >> "$BINDINGS_CONF"
-    echo "bindd = SUPER SHIFT, T, Themarchy, exec, $THEMARCHY_SCRIPT" >> "$BINDINGS_CONF"
-
-    hyprctl reload 2>/dev/null || true
-    echo -e "  ${DIM}✓${RESET}  Bound SUPER+SHIFT+T to Themarchy"
-    SUMMARY_LOG+=("✓  Themarchy keybind -- bound SUPER+SHIFT+T")
-    echo
+    apply_lua_block "Enable Themarchy Keybind (SUPER+SHIFT+T)" \
+        "Binds SUPER+SHIFT+T to apply a theme generated from the current wallpaper ($THEMARCHY_SCRIPT)." \
+        "$BINDINGS_LUA" "themarchy" "Themarchy keybind -- bound SUPER+SHIFT+T" \
+        "hl.unbind(\"SUPER + SHIFT + T\")
+o.bind(\"SUPER + SHIFT + T\", \"Themarchy\", \"$THEMARCHY_SCRIPT\")"
 }
 
 remove_themarchy_keybind() {
-    clear
-    echo
-    echo
-    echo -e "${BOLD}  Disable Themarchy Keybind (SUPER+SHIFT+T)${RESET}"
-    echo
-    echo -e "  ${DIM}Removes the SUPER+SHIFT+T Themarchy keybinding.${RESET}"
-    echo
-    echo
-
-    if [[ ! -f "$BINDINGS_CONF" ]]; then
-        echo -e "  ${DIM}✗${RESET}  bindings.conf not found at $BINDINGS_CONF"
-        echo
-        SUMMARY_LOG+=("✗  Themarchy keybind -- failed (config not found)")
-        return 1
-    fi
-
-    if ! grep -q "SUPER SHIFT, T, Themarchy" "$BINDINGS_CONF"; then
-        echo -e "  ${DIM}Not bound. Nothing to do.${RESET}"
-        echo
-        SUMMARY_LOG+=("--  Themarchy keybind -- not bound")
-        return 0
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]]; then
-        printf "  ${BOLD}Continue?${RESET} ${DIM}(yes/no)${RESET} "
-        read -r < /dev/tty
-    fi
-
-    if [[ "$CONFIRM_ALL" != true ]] && [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo
-        echo "  Cancelled."
-        echo
-        SUMMARY_LOG+=("--  Themarchy keybind -- cancelled")
-        return 0
-    fi
-
-    echo
-
-    local backup_file="${BINDINGS_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$BINDINGS_CONF" "$backup_file"
-    echo -e "  ${DIM}Backup: $backup_file${RESET}"
-
-    sed -i '/SUPER SHIFT, T, Themarchy/d' "$BINDINGS_CONF"
-    hyprctl reload 2>/dev/null || true
-
-    echo -e "  ${DIM}✓${RESET}  Removed SUPER+SHIFT+T Themarchy keybind"
-    SUMMARY_LOG+=("✓  Themarchy keybind -- removed")
-    echo
+    apply_lua_block "Disable Themarchy Keybind" \
+        "Removes the SUPER+SHIFT+T Themarchy keybinding." \
+        "$BINDINGS_LUA" "themarchy" "Themarchy keybind -- removed"
 }
 
 # =============================================================================
@@ -8220,12 +6353,12 @@ declare -a APPEARANCE_ITEMS=(
     "rounded_corners|Rounded corners|Enable|Disable|toggle|Round or square corners on windows, menus, notifications, and UI"
     "window_gaps|Window gaps|Remove|Restore|toggle|Remove or restore gaps between tiled windows"
     "transparency|Transparency|Remove|Restore|toggle|Remove or restore window transparency effects"
-    "tray_icons|Tray icons|Show all|Hide|toggle|Show all system tray icons or hide extras"
-    "omarchy_logo|Omarchy logo|Remove|Restore|toggle|Remove or restore the Omarchy logo button on the waybar"
-    "update_icon|Update icon|Remove|Restore|toggle|Remove or restore the update notification icon on the waybar"
-    "clock_format|Clock format|12h|24h|radio|Set waybar clock to 12-hour or 24-hour format"
-    "clock_date|Clock date|Show|Hide|toggle|Show or hide the day name on the waybar clock"
-    "window_title|Window title|Show|Hide|toggle|Show active window name on waybar next to workspaces"
+    "tray_icons|Tray icons|Show all|Hide|toggle|Pin every tray icon to the bar, or collapse them into the tray drawer"
+    "omarchy_logo|Omarchy logo|Remove|Restore|toggle|Remove or restore the Omarchy logo menu button on the bar"
+    "update_icon|Update icon|Remove|Restore|toggle|Remove or restore the system update icon on the bar"
+    "clock_format|Clock format|12h|24h|radio|Set the bar clock to 12-hour or 24-hour format"
+    "clock_date|Clock date|Show|Hide|toggle|Show or hide the day name on the bar clock"
+    "window_title|Window title|Show|Hide|toggle|Show active window title on the bar next to workspaces"
     "media_dirs|Media dirs|Enable|Disable|toggle|Organize screenshots and recordings into subdirs"
 )
 
@@ -8310,14 +6443,12 @@ declare -a EXTRA_THEMES=(
     "Black Money|https://github.com/HANCORE-linux/omarchy-blackmoney-theme"
     "Black Turq|https://github.com/HANCORE-linux/omarchy-blackturq-theme"
     "Blackwall|https://github.com/rlind3r/omarchy-blackwall-theme"
-    "Bliss|https://github.com/mishonki3/omarchy-bliss-theme"
     "Blue Ridge Dark|https://github.com/hipsterusername/omarchy-blueridge-dark-theme"
     "bluedotrb|https://github.com/dotsilva/omarchy-bluedotrb-theme"
     "Boring|https://github.com/geohot/omarchy-boring-theme"
     "Brutalism|https://github.com/bjornramberg/omarchy-brutalism-theme"
     "C64|https://github.com/scar45/omarchy-c64-theme"
     "Caroline Skyline|https://github.com/OldJobobo/omarchy-caroline-skyline-theme"
-    "Catppu Mocha|https://github.com/ankur311sudo/Catppu_Mocha"
     "Catppuccin Mocha|https://github.com/KidDogDad/omarchy-catppuccin-mocha-theme"
     "Catppuccin Mocha Dark|https://github.com/Luquatic/omarchy-catppuccin-dark"
     "Cattpuccin Glass|https://github.com/Luquatic/omarchy-catppuccin-glass"
@@ -8350,7 +6481,6 @@ declare -a EXTRA_THEMES=(
     "Duskwire|https://github.com/Grey-007/duskwire"
     "Dustyfog|https://github.com/atif-1402/omarchy-dustyfog-theme"
     "Eldritch|https://github.com/eldritch-theme/omarchy"
-    "Eldritch Official|https://github.com/eldritch-theme/omarchy-eldritch-theme"
     "Elysian|https://github.com/bjarneo/omarchy-elysian-theme"
     "Ember n Ash|https://github.com/Hydradevx/omarchy-ember-n-ash-theme"
     "Eva-01|https://github.com/Ludurn/omarchy-eva01-theme"
@@ -8377,12 +6507,10 @@ declare -a EXTRA_THEMES=(
     "Greek Noir|https://github.com/HANCORE-linux/omarchy-greek-noir-theme"
     "Green City|https://github.com/zillamtt/omarchy-green-city"
     "Green Garden|https://github.com/kalk-ak/omarchy-green-garden-theme"
-    "Green Hakkar|https://github.com/joaquinmeza/omarchy-hakker-green-theme"
     "Grimdark Solarized|https://github.com/OldJobobo/omarchy-grimdark-solarized-theme"
     "Gruber Darker|https://github.com/celsobenedetti/omarchy-gruber-darker"
     "Gruber Tsoding|https://github.com/davide-ferrara/omarchy-gruberdark-tsoding-theme"
     "Grudark|https://github.com/zillamtt/omarchy-grudark"
-    "Gruvu|https://github.com/ankur311sudo/gruvu"
     "Gruvy Glass|https://github.com/signaldirective/gruvy-glass"
     "GTA|https://github.com/jordan-ops/omarchy-GTA-theme"
     "Hakkar Green|https://github.com/JonasAllenCodes/omarchy-hakkar-green-better-contrast-theme"
@@ -8501,7 +6629,6 @@ declare -a EXTRA_THEMES=(
     "Terramour|https://github.com/atif-1402/omarchy-terramour-theme"
     "The Greek|https://github.com/HANCORE-linux/omarchy-thegreek-theme"
     "Tokyo Night OLED|https://github.com/Justin-De-Sio/omarchy-tokyoled-theme"
-    "Torrentz Hydra|https://github.com/monoooki/omarchy-torrentz-hydra-theme"
     "Tycho|https://github.com/leonardobetti/omarchy-tycho"
     "Type17|https://github.com/atif-1402/omarchy-type17-theme"
     "Van Gogh|https://github.com/Nirmal314/omarchy-van-gogh-theme"
@@ -8525,7 +6652,7 @@ declare -a EXTRA_THEMES=(
 # Selection state for themes (by display name): 0=not selected, 1=selected
 declare -A THEME_SELECTIONS=()
 
-# Hyprland General settings (write to looknfeel.conf)
+# Hyprland General settings (written to looknfeel.lua)
 declare -a HYPR_GENERAL_ITEMS=(
     "gaps_in|Gap between windows|int:0:100|general|gaps_in|5|looknfeel|Gap size between tiled windows"
     "gaps_out|Gap from edges|int:0:100|general|gaps_out|10|looknfeel|Gap size from screen edges"
@@ -8533,10 +6660,8 @@ declare -a HYPR_GENERAL_ITEMS=(
     "active_border|Active border color|color|general|col.active_border|rgba(33ccffee) rgba(00ff99ee) 45deg|looknfeel|Border color of focused window"
     "inactive_border|Inactive border color|color|general|col.inactive_border|rgba(595959aa)|looknfeel|Border color of unfocused windows"
     "resize_on_border|Drag-resize borders|bool|general|resize_on_border|false|looknfeel|Allow resizing windows by dragging borders"
-    "no_border_floating|No border floating|bool|general|no_border_on_floating|false|looknfeel|Remove borders from floating windows"
     "allow_tearing|Allow screen tearing|bool|general|allow_tearing|false|looknfeel|Allow tearing for reduced input lag"
     "layout|Window layout|enum:dwindle:master|general|layout|dwindle|looknfeel|Tiling layout algorithm"
-    "pseudotile|Pseudotiling|bool|dwindle|pseudotile|true|looknfeel|Windows keep requested size in tiling"
     "preserve_split|Keep split direction|bool|dwindle|preserve_split|true|looknfeel|Maintain split direction on resize"
     "force_split|Split direction|enum:0:1:2|dwindle|force_split|2|looknfeel|0=follow mouse 1=left/top 2=right/bottom"
     "smart_split|Smart split|bool|dwindle|smart_split|false|looknfeel|Split direction follows cursor position"
@@ -8544,7 +6669,7 @@ declare -a HYPR_GENERAL_ITEMS=(
     "focus_on_activate|Focus on activation|bool|misc|focus_on_activate|true|looknfeel|Focus windows when they request activation"
     "disable_logo|Disable startup logo|bool|misc|disable_hyprland_logo|true|looknfeel|Hide the Hyprland logo on startup"
     "vrr|Variable refresh rate|enum:0:1:2|misc|vrr|0|looknfeel|0=off 1=on 2=fullscreen only (FreeSync/G-Sync)"
-    "new_window_fullscreen|New window vs fullscreen|enum:0:1:2|misc|new_window_takes_over_fullscreen|0|looknfeel|0=behind 1=unfullscreen 2=new fullscreen"
+    "new_window_fullscreen|Focus under fullscreen|enum:0:1:2|misc|on_focus_under_fullscreen|2|looknfeel|0=stay behind 1=take over 2=unfullscreen"
     "extend_border_grab|Border grab area|int:0:50|general|extend_border_grab_area|15|looknfeel|Extra pixels for grabbing window borders"
     "middle_click_paste|Middle click paste|bool|misc|middle_click_paste|true|looknfeel|Paste clipboard on middle mouse click"
     "enable_swallow|Window swallowing|bool|misc|enable_swallow|false|looknfeel|Terminal windows absorb spawned child windows"
@@ -8555,7 +6680,7 @@ declare -a HYPR_GENERAL_ITEMS=(
     "mouse_dpms|Mouse wakes display|bool|misc|mouse_move_enables_dpms|true|looknfeel|Mouse movement wakes display from DPMS off"
 )
 
-# Hyprland Decoration settings (write to looknfeel.conf)
+# Hyprland Decoration settings (written to looknfeel.lua)
 declare -a HYPR_DECORATION_ITEMS=(
     "rounding|Corner radius|int:0:30|decoration|rounding|0|looknfeel|Window corner rounding in pixels. See also: Appearance"
     "shadow_enabled|Shadows|bool|decoration.shadow|enabled|true|looknfeel|Enable window drop shadows"
@@ -8575,13 +6700,12 @@ declare -a HYPR_DECORATION_ITEMS=(
     "dim_strength|Dim strength|float:0.0:1.0|decoration|dim_strength|0.5|looknfeel|How much to dim inactive windows"
     "dim_special|Dim special ws bg|float:0.0:1.0|decoration|dim_special|0.2|looknfeel|Dim amount for special workspace background"
     "cursor_hide|Hide cursor on type|bool|cursor|hide_on_key_press|true|looknfeel|Hide cursor when typing"
-    "cursor_size|Cursor size|int:16:48|cursor|size|24|looknfeel|Cursor size in pixels"
     "active_opacity|Active opacity|float:0.0:1.0|decoration|active_opacity|1.0|looknfeel|Opacity of focused window (1.0=opaque)"
     "inactive_opacity|Inactive opacity|float:0.0:1.0|decoration|inactive_opacity|1.0|looknfeel|Opacity of unfocused windows (1.0=opaque)"
     "fullscreen_opacity|Fullscreen opacity|float:0.0:1.0|decoration|fullscreen_opacity|1.0|looknfeel|Opacity of fullscreen windows (1.0=opaque)"
 )
 
-# Hyprland Input settings (write to input.conf)
+# Hyprland Input settings (written to input.lua)
 declare -a HYPR_INPUT_ITEMS=(
     "sensitivity|Mouse sensitivity|float:-1.0:1.0|input|sensitivity|0|input|Mouse sensitivity (-1.0 to 1.0)"
     "follow_mouse|Focus follows mouse|enum:0:1:2:3|input|follow_mouse|1|input|0=off 1=always 2=click-unfocus 3=lock-unfocus"
@@ -8601,7 +6725,7 @@ declare -a HYPR_INPUT_ITEMS=(
     "scroll_method|Scroll method|enum:2fg:edge:on_button_down:no_scroll|input|scroll_method|2fg|input|Touchpad scroll method"
 )
 
-# Hyprland Gestures settings (write to looknfeel.conf)
+# Hyprland Gestures settings (written to looknfeel.lua)
 declare -a HYPR_GESTURES_ITEMS=(
     "ws_swipe|Workspace swipe|bool|gestures|workspace_swipe|false|looknfeel|Swipe between workspaces on touchpad"
     "ws_swipe_fingers|Swipe fingers|int:2:5|gestures|workspace_swipe_fingers|3|looknfeel|Number of fingers for workspace swipe"
@@ -8624,10 +6748,12 @@ get_theme_dir_name() {
     local repo_name="${url##*/}"
     # Remove trailing slash if present
     repo_name="${repo_name%/}"
-    # Strip omarchy- prefix and -theme suffix to match omarchy-theme-install behavior
+    # Match omarchy-theme-install: drop .git, strip omarchy- prefix and -theme
+    # suffix, then lowercase
+    repo_name="${repo_name%.git}"
     repo_name="${repo_name#omarchy-}"
     repo_name="${repo_name%-theme}"
-    echo "$repo_name"
+    echo "${repo_name,,}"
 }
 
 # Check if a theme is already installed
@@ -8703,6 +6829,8 @@ declare SELECTED_PRIMARY_MONITOR=""  # "", monitor name (e.g. "HDMI-A-1")
 # Keybind Editor data structures
 declare -a EDIT_BINDINGS_ITEMS=()
 declare -A BINDING_EDITS=()  # idx -> "new_mods|new_key"
+declare -a BINDING_LUA_ACTIONS=()  # action expressions copied verbatim when rebinding
+declare -A BINDING_ORIG_KEYS=()    # idx -> original Lua keys of a moved binding
 declare -a VALID_KEYS=(
     A B C D E F G H I J K L M N O P Q R S T U V W X Y Z
     0 1 2 3 4 5 6 7 8 9
@@ -10271,10 +8399,10 @@ fi
 [ "$DISABLE_FIDO2" = true ] && ACTION_SUMMARY+=("Disable FIDO2 auth")
 [ "$SHOW_ALL_TRAY_ICONS" = true ] && ACTION_SUMMARY+=("Show all tray icons")
 [ "$HIDE_TRAY_ICONS" = true ] && ACTION_SUMMARY+=("Hide tray icons")
-[ "$REMOVE_OMARCHY_LOGO" = true ] && ACTION_SUMMARY+=("Remove Omarchy logo from waybar")
-[ "$RESTORE_OMARCHY_LOGO" = true ] && ACTION_SUMMARY+=("Restore Omarchy logo to waybar")
-[ "$REMOVE_UPDATE_ICON" = true ] && ACTION_SUMMARY+=("Remove update icon from waybar")
-[ "$RESTORE_UPDATE_ICON" = true ] && ACTION_SUMMARY+=("Restore update icon to waybar")
+[ "$REMOVE_OMARCHY_LOGO" = true ] && ACTION_SUMMARY+=("Remove Omarchy logo from bar")
+[ "$RESTORE_OMARCHY_LOGO" = true ] && ACTION_SUMMARY+=("Restore Omarchy logo to bar")
+[ "$REMOVE_UPDATE_ICON" = true ] && ACTION_SUMMARY+=("Remove update icon from bar")
+[ "$RESTORE_UPDATE_ICON" = true ] && ACTION_SUMMARY+=("Restore update icon to bar")
 [ "$ENABLE_ROUNDED_CORNERS" = true ] && ACTION_SUMMARY+=("Enable rounded corners")
 [ "$DISABLE_ROUNDED_CORNERS" = true ] && ACTION_SUMMARY+=("Disable rounded corners")
 [ "$REMOVE_WINDOW_GAPS" = true ] && ACTION_SUMMARY+=("Remove window gaps")

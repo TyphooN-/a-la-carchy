@@ -6,6 +6,8 @@
 
 A two-panel TUI (Terminal User Interface) debloater and optimizer for Omarchy Linux.
 
+> **Requires a current Omarchy release** — one that configures Hyprland in Lua (`~/.config/hypr/hyprland.lua`) and uses the Omarchy shell (Quickshell) for the bar, menus and notifications. Run `omarchy update` first if you are on an older install.
+
 ## Features
 
 - **Two-panel TUI** with categories on the left and items on the right
@@ -13,9 +15,9 @@ A two-panel TUI (Terminal User Interface) debloater and optimizer for Omarchy Li
 - Interactive checklist of preinstalled packages and webapps
 - Only shows packages and webapps that are currently installed
 - **Themarchy** — generate and apply a cohesive theme from your current wallpaper with one keybind (SUPER+SHIFT+T)
-- **252 extra community themes** browseable and installable with one click
+- **246 extra community themes** browseable and installable with one click
 - **Keybind Editor** to view and rebind all Hyprland keybindings via guided dialog
-- **Hyprland Configurator** with 69 settings across 4 categories (General, Decoration, Input, Gestures)
+- **Hyprland Configurator** with 66 settings across 4 categories (General, Decoration, Input, Gestures)
 - **Multi-monitor management** with detection, positioning, primary monitor, and laptop auto-off
 - **ASUS ROG hardware control** via asusctl (platform profiles, Aura RGB, Slash Ledbar, fan curves, GPU MUX, battery management, power tuning, AniMe Matrix, and more)
 - **30 configuration tweaks** for keybindings, display, system, appearance, keyboard, and utilities
@@ -23,7 +25,7 @@ A two-panel TUI (Terminal User Interface) debloater and optimizer for Omarchy Li
 - **Summary screen** after all actions complete
 - Safe removal with confirmation prompts
 - **No installation required** - just run the one-liner command!
-- No external dependencies needed
+- No external dependencies beyond what Omarchy ships (`jq`, `hyprctl`)
 
 ## Quick Start (One-Liner)
 
@@ -112,7 +114,7 @@ The script can also remove the following preinstalled Omarchy webapps:
 
 #### Keybind Editor
 
-A full keybinding editor that loads all active Hyprland bindings from config files and displays them in a scrollable list organized by section (Clipboard, Tiling, Utilities, Media, User Bindings). Modified bindings are marked with a `*` prefix.
+A full keybinding editor that loads Omarchy's Hyprland bindings and displays them in a scrollable list organized by section (Tiling, Clipboard, Utilities, Media, Applications, User Bindings). Modified bindings are marked with a `*` prefix.
 
 **Edit flow** — press Space on any binding to start a guided 3-step rebind:
 
@@ -122,14 +124,13 @@ A full keybinding editor that loads all active Hyprland bindings from config fil
 
 Press `R` to reset a pending edit back to its current value.
 
-On confirm, the editor writes `unbind` + `bindd` pairs to `~/.config/hypr/bindings.conf`, following Hyprland's standard override pattern. Existing overrides from previous sessions are detected and applied in-place so the editor always shows the currently active bindings.
+On confirm, the editor writes `hl.unbind(...)` + `o.bind(...)` pairs to a managed `keybind-edits` block at the end of `~/.config/hypr/bindings.lua`. The binding's original action is copied verbatim, so rebinding never changes what a key does. Existing overrides are detected and shown in place, and moving a binding back to its original key removes its override.
+
+Loop-generated bindings (such as the per-workspace keys) are not listed, since they can't be rebound one at a time.
 
 **Data sources:**
-- `~/.local/share/omarchy/default/hypr/bindings/clipboard.conf`
-- `~/.local/share/omarchy/default/hypr/bindings/tiling-v2.conf`
-- `~/.local/share/omarchy/default/hypr/bindings/utilities.conf`
-- `~/.local/share/omarchy/default/hypr/bindings/media.conf`
-- `~/.config/hypr/bindings.conf` (user overrides)
+- `$OMARCHY_PATH/default/hypr/bindings/{tiling,clipboard,utilities,media,applications}.lua` (read only)
+- `~/.config/hypr/bindings.lua` (user bindings and overrides)
 
 #### Hyprland Configurator
 
@@ -141,7 +142,7 @@ A dedicated Hyprland section with 69 curated settings across 4 categories, offer
 - **Enum** — arrow-key option selection
 - **Color** — text input supporting `rgba()`, `rgb()`, and gradients
 
-Modified settings show a `*` prefix and `current > new` values. Press `R` to reset a pending edit. On confirm, settings are written to `~/.config/hypr/looknfeel.conf` or `~/.config/hypr/input.conf` as appropriate.
+Modified settings show a `*` prefix and `current > new` values. Press `R` to reset a pending edit. On confirm, settings are written as a Lua `hl.config({...})` block to `~/.config/hypr/looknfeel.lua` or `~/.config/hypr/input.lua` as appropriate, and Hyprland is reloaded and checked for config errors. Workspace swipe is written as an `hl.gesture(...)` binding.
 
 Previous settings are detected on subsequent runs so you always see your current configuration.
 
@@ -156,11 +157,9 @@ Previous settings are detected on subsequent runs so you always see your current
 | Active border color | color | Border color of focused window |
 | Inactive border color | color | Border color of unfocused windows |
 | Drag-resize borders | bool | Allow resizing windows by dragging borders |
-| No border floating | bool | Remove borders from floating windows |
 | Border grab area | int 0-50 | Extra pixels for grabbing window borders |
 | Allow screen tearing | bool | Allow tearing for reduced input lag |
 | Window layout | dwindle/master | Tiling layout algorithm |
-| Pseudotiling | bool | Windows keep requested size in tiling |
 | Keep split direction | bool | Maintain split direction on resize |
 | Split direction | 0/1/2 | Follow mouse, left/top, or right/bottom |
 | Smart split | bool | Split direction follows cursor position |
@@ -168,7 +167,7 @@ Previous settings are detected on subsequent runs so you always see your current
 | Focus on activation | bool | Focus windows when they request activation |
 | Disable startup logo | bool | Hide the Hyprland logo on startup |
 | Variable refresh rate | 0/1/2 | Off, on, or fullscreen only (FreeSync/G-Sync) |
-| New window vs fullscreen | 0/1/2 | Behind, unfullscreen, or new fullscreen |
+| Focus under fullscreen | 0/1/2 | Stay behind, take over, or unfullscreen |
 | Middle click paste | bool | Paste clipboard on middle mouse click |
 | Window swallowing | bool | Terminal windows absorb spawned child windows |
 | Workspace back-forth | bool | Same workspace key toggles to previous |
@@ -202,7 +201,6 @@ Previous settings are detected on subsequent runs so you always see your current
 | Dim strength | float 0.0-1.0 | How much to dim inactive windows |
 | Dim special ws bg | float 0.0-1.0 | Dim amount for special workspace background |
 | Hide cursor on type | bool | Hide cursor when typing |
-| Cursor size | int 16-48 | Cursor size in pixels |
 | Active opacity | float 0.0-1.0 | Opacity of focused window |
 | Inactive opacity | float 0.0-1.0 | Opacity of unfocused windows |
 | Fullscreen opacity | float 0.0-1.0 | Opacity of fullscreen windows |
@@ -247,8 +245,8 @@ Previous settings are detected on subsequent runs so you always see your current
 </details>
 
 **Config files written:**
-- `~/.config/hypr/looknfeel.conf` — General, Decoration, and Gestures settings (managed block)
-- `~/.config/hypr/input.conf` — Input settings (managed block)
+- `~/.config/hypr/looknfeel.lua` — General, Decoration, and Gestures settings (managed block)
+- `~/.config/hypr/input.lua` — Input settings (managed block)
 
 #### Keyboard & Input
 
@@ -267,7 +265,7 @@ Previous settings are detected on subsequent runs so you always see your current
 
 | Tweak | Type | Description |
 |-------|------|-------------|
-| Monitor scale | radio | Set 4K (GDK_SCALE=1.75, scale 1.666667) or 1080p/1440p (GDK_SCALE=1, no scaling) |
+| Monitor scale | radio | Set 4K (GDK_SCALE=1.75, scale 1.666667) or 1080p/1440p (GDK_SCALE=1, no scaling) via the scale variables at the top of `monitors.lua` |
 | Detect monitors | action | Scan connected displays and show resolution, scale, position, and make/model |
 | Position monitors | action | Arrange multi-monitor layout with a guided step-by-step editor |
 | Laptop display | toggle | Auto-disable laptop screen when an external display is connected |
@@ -298,15 +296,15 @@ Press Space on "Position monitors" to open a guided multi-step editor for arrang
 
 **Step 3 — Preview & confirm:** Review all monitors with their calculated positions and rotations, then type `yes` to queue the layout.
 
-On confirm, the layout is written to `~/.config/hypr/monitors.conf` with:
-- One `monitor=<name>,preferred,<x>x<y>,<scale>,transform,<n>` line per display
-- `env = GDK_SCALE` set automatically (1.75 if any monitor scale > 1.5, otherwise 1)
-- A `monitor=,preferred,auto,1` fallback line for hot-plugged displays
+On confirm, the layout is written to a managed `monitor-layout` block in `~/.config/hypr/monitors.lua`:
+- One `hl.monitor({...})` rule per display, matched by its description (`desc:...`) so it follows the monitor if it moves to another port
+- Each monitor's **current mode, refresh rate, VRR and bit depth are preserved** (e.g. a 170 Hz, 10-bit FreeSync panel stays that way)
+- Omarchy's own catch-all rule still covers hot-plugged displays
 - Timestamped backup of the previous config
 
 Supports L-shaped and stacked layouts — each secondary monitor can be placed relative to any already-placed monitor, not just the primary.
 
-If a per-monitor layout already exists and you select the generic "Monitor scale" option (4K or 1080p/1440p), a warning is shown that it will replace the per-monitor config.
+The generic "Monitor scale" option (4K or 1080p/1440p) only changes Omarchy's default scale variables, so monitors with their own rule keep their settings.
 
 ##### Laptop Display Auto-Off
 
@@ -316,12 +314,12 @@ Toggle "Laptop display" to "Auto off" to automatically disable the laptop screen
 
 1. Creates a watcher script at `~/.config/hypr/scripts/laptop-display-auto.sh` that:
    - Detects the laptop display (eDP-*) and the backlight device (auto-detected from `/sys/class/backlight/`)
-   - On external display connect: disables the laptop monitor via `hyprctl keyword monitor` and turns off the backlight via `brightnessctl`
+   - On external display connect: disables the laptop monitor via `hyprctl eval 'hl.monitor({...})'` and turns off the backlight via `brightnessctl`
    - On external display disconnect: restores the laptop monitor and brightness
    - Saves the current brightness level before turning off and restores it exactly
    - Monitors for plug/unplug events via Hyprland's IPC socket (falls back to `nc`, then 5-second polling if `socat` is unavailable)
    - Includes a 1-second debounce to prevent rapid event oscillation
-2. Adds an `exec-once` line to `~/.config/hypr/monitors.conf` (managed block) so the watcher starts automatically on login
+2. Adds a `hyprland.start` hook to `~/.config/hypr/autostart.lua` (managed block) so the watcher starts automatically on login
 3. Starts the watcher immediately (no logout required)
 
 Toggle to "Normal" to disable: removes the watcher script, kills any running instance, removes the managed block from config, and re-enables the laptop display with restored brightness.
@@ -331,10 +329,9 @@ Toggle to "Normal" to disable: removes the watcher script, kills any running ins
 Press Space on "Primary monitor" to open an arrow-key selection dialog listing all connected monitors. Select which monitor should own workspace 1 (the default workspace).
 
 On confirm:
-1. Workspace 1 is moved to the selected monitor immediately via `hyprctl dispatch`
+1. Workspace 1 is moved to the selected monitor immediately
 2. All other monitors are assigned incrementing workspaces (2, 3, ...) both live and persisted
-3. The selection is persisted in `~/.config/hypr/monitors.conf` via a managed block so it survives reboots
-4. Wallpaper layers are restarted (`swaybg`) to fix positioning after workspace moves
+3. The selection is persisted as `hl.workspace_rule({...})` rules (matched by monitor description) in a managed block in `~/.config/hypr/monitors.lua`
 
 Requires 2+ monitors. If only one monitor is detected, the dialog shows a message and returns.
 
@@ -344,26 +341,28 @@ All items below are in the **Appearance** category in the TUI.
 
 | Tweak | Description |
 |-------|-------------|
-| Enable rounded corners | Adds rounded corners to windows, Walker menus, SwayOSD, hyprlock, mako notifications, and waybar tooltips |
-| Disable rounded corners | Returns all UI elements to sharp/square corners |
+| Enable rounded corners | Sets Hyprland `decoration.rounding = 8`; the Omarchy shell (bar, menus, notifications, OSD, lock screen) follows it automatically |
+| Disable rounded corners | Returns to Omarchy's square corners |
 | Remove window gaps | Maximize screen real estate |
 | Restore window gaps | Return to default window spacing |
-| Remove transparency | Remove window transparency effects (makes all windows fully opaque) |
+| Remove transparency | Adds a window rule that makes all windows fully opaque, overriding Omarchy's default and browser opacity |
 | Restore transparency | Restore default window transparency rules |
-| Show all tray icons | All system tray icons always visible |
-| Hide tray icons | Use expander for cleaner bar |
-| Remove Omarchy logo | Remove the Omarchy logo button from the left of the waybar |
-| Restore Omarchy logo | Bring the Omarchy logo button back to the waybar |
-| Remove update icon | Remove the update notification icon from the waybar |
-| Restore update icon | Bring the update notification icon back to the waybar |
+| Show all tray icons | Pins every running tray app so its icon stays on the bar |
+| Hide tray icons | Unpins them so they collapse into the tray drawer (Omarchy default) |
+| Remove Omarchy logo | Remove the Omarchy logo menu button from the bar (the menu stays on SUPER+ALT+SPACE) |
+| Restore Omarchy logo | Put the Omarchy logo menu button back at the left of the bar |
+| Remove update icon | Remove the system update icon from the bar |
+| Restore update icon | Put the system update icon back on the bar |
 | Enable 12-hour clock | Clock displays with AM/PM |
 | Disable 12-hour clock | 24-hour format |
 | Show clock date | Display day name on clock (e.g. "Sunday 10:55 AM") |
 | Hide clock date | Show time only (e.g. "10:55 AM") |
 | Show window title | Display active window name next to workspaces |
-| Hide window title | Remove active window name from waybar |
-| Enable media directories | Screenshots → `~/Pictures/Screenshots`, Recordings → `~/Videos/Screencasts` |
+| Hide window title | Remove active window name from the bar |
+| Enable media directories | Screenshots → `~/Pictures/Screenshots`, Recordings → `~/Videos/Screencasts` (via `~/.config/uwsm/default`, applies after next login) |
 | Disable media directories | Use default `~/Pictures` and `~/Videos` |
+
+Bar tweaks edit `~/.config/omarchy/shell.json` (through `omarchy bar` where possible); the shell picks up changes immediately.
 
 #### System Features
 
@@ -379,7 +378,7 @@ All items below are in the **Appearance** category in the TUI.
 | Disable FIDO2 auth | Remove security key authentication |
 | Power profile | Set default power profile (power-saver, balanced, performance) restored on startup |
 | Auto-switch profiles | Configure which profiles to use when AC power is connected or disconnected, or disable auto-switching entirely |
-| Battery limit | Set maximum battery charge level (60%/70%/80%/90%/100%) with walker power menu integration |
+| Battery limit | Set maximum battery charge level (60%/70%/80%/90%/100%) with an Omarchy menu picker |
 
 ##### Power Profile
 
@@ -394,7 +393,7 @@ The dialog marks the currently active profile with `(active)` and any previously
 On confirm, the selected profile is:
 1. Applied immediately via `powerprofilesctl set`
 2. Persisted across reboots by creating a startup script at `~/.config/hypr/scripts/power-profile-default.sh`
-3. Auto-started on login via an `exec-once` managed block in `~/.config/hypr/monitors.conf`
+3. Auto-started on login via a `hyprland.start` hook in a managed block in `~/.config/hypr/autostart.lua`
 
 Requires `power-profiles-daemon` (provides `powerprofilesctl`). If not installed, the dialog shows a graceful error message.
 
@@ -428,37 +427,21 @@ On confirm, the selected limit is:
 1. Applied immediately via `sudo tee` to `/sys/class/power_supply/BAT*/charge_control_end_threshold`
 2. Persisted across reboots by writing a udev rule at `/etc/udev/rules.d/99-battery-charge-limit.rules`
 3. Udev rules reloaded via `udevadm control --reload-rules`
-4. Waybar battery tooltip updated to show the configured limit (e.g. "80% plugged (limit: 80%)")
-5. Waybar plugged icon changed from plug to battery (since the battery stops charging at the limit)
-6. Battery limit helper script installed at `~/.config/hypr/scripts/omarchy-battery-limit.sh`
-7. Walker power menu override installed in `~/.config/omarchy/extensions/menu.sh`
+4. Battery limit helper script installed at `~/.config/hypr/scripts/omarchy-battery-limit.sh`
+5. A **Setup > Battery Limit** picker added to the Omarchy menu (`~/.config/omarchy/extensions/omarchy-menu.jsonc`)
 
-Setting 100% (no limit) removes the udev rule, helper script, and power menu override, and restores original waybar icon and tooltips.
+Setting 100% (no limit) removes the udev rule, helper script, and menu picker.
 
 Requires a battery with kernel-exposed `charge_control_end_threshold` support. If not available, the dialog shows a graceful error message.
 
-##### Walker Power Menu Integration
+##### Omarchy Menu Integration
 
-When a battery charge limit is set (any value other than 100%), the Omarchy power profile menu (accessed by clicking the battery icon in waybar) is enhanced with a charge limit display:
+When a battery charge limit is set (any value other than 100%), the Omarchy menu gets a **Setup > Battery Limit** submenu listing the five presets, with a ✓ next to the active one. Picking one applies it through the helper script:
 
-```
-┌─────────────────────────────┐
-│ Power…                      │
-│   performance               │
-│   balanced        ← current │
-│   power-saver               │
-│   ─────────────────         │
-│   󰁹 Charge limit: 80%      │
-│   ████████████████░░░░  80% │
-└─────────────────────────────┘
-```
-
-- A visual bar using `█` (filled) and `░` (empty) blocks shows the current limit
-- Selecting the charge limit line opens a sub-menu with all five percentage options
-- The sub-menu pre-selects the current value
 - Changing the limit uses `pkexec` for authentication (GUI-friendly, no terminal needed)
+- The udev rule is updated so the new limit survives reboots
 - A desktop notification confirms the change
-- Waybar tooltips are updated and waybar is restarted automatically
+- The submenu only appears on machines that expose `charge_control_end_threshold`
 
 #### Utilities
 
@@ -655,11 +638,11 @@ Generate and apply a full Omarchy theme from your current wallpaper's colors.
 
 1. **Color extraction** — [pywal](https://github.com/dylanaraps/pywal) (`wal -i "$WALLPAPER" -n -q`) generates a 16-color palette from the wallpaper and writes it to `~/.cache/wal/colors.json`
 2. **Palette mapping** — a Python script reads the pywal JSON and maps `special.background`, `special.foreground`, `special.cursor`, and `colors.color0–color15` into `colors.toml`, with `color5` used as the `accent`
-3. **Theme application** — the current wallpaper is copied into the theme's `backgrounds/` folder, then `omarchy-theme-set themarchy` applies the palette to all Omarchy components (kitty, waybar, Walker, mako, hyprlock, Hyprland borders, SwayOSD)
+3. **Theme application** — the current wallpaper is copied into the theme's `backgrounds/` folder, then `omarchy-theme-set themarchy` applies the palette to all Omarchy components (terminals, the Omarchy shell bar/menus/notifications/lock screen, Hyprland borders)
 
 #### Wallpaper detection
 
-Themarchy reads `~/.config/omarchy/current/background` (the Omarchy symlink) as the primary wallpaper source, with a fallback to the running `swaybg` process.
+Themarchy reads `~/.local/state/omarchy/current/background` (the Omarchy background symlink).
 
 #### Files created
 
@@ -673,7 +656,7 @@ Requires `python-pywal` (AUR) and `python3`. If pywal is not installed, A La Car
 
 ### Extra Themes
 
-Browse and install 252 community-made themes directly from the TUI. Themes are sourced from the [Omarchy Extra Themes](https://learn.omacom.io/2/the-omarchy-manual/90/extra-themes) directory and installed via `omarchy-theme-install`.
+Browse and install 246 community-made themes directly from the TUI. Themes are sourced from the [Omarchy Extra Themes](https://learn.omacom.io/2/the-omarchy-manual/90/extra-themes) directory and installed via `omarchy-theme-install`.
 
 - Already-installed themes are marked with `(installed)` and skipped during installation
 - The last theme installed becomes the active theme
@@ -682,7 +665,7 @@ Browse and install 252 community-made themes directly from the TUI. Themes are s
 - Themes that require GitHub authentication are automatically skipped after a timeout
 
 <details>
-<summary>Available themes (252)</summary>
+<summary>Available themes (246)</summary>
 
 | Theme | Repository |
 |-------|------------|
@@ -728,14 +711,12 @@ Browse and install 252 community-made themes directly from the TUI. Themes are s
 | Black Money | HANCORE-linux/omarchy-blackmoney-theme |
 | Black Turq | HANCORE-linux/omarchy-blackturq-theme |
 | Blackwall | rlind3r/omarchy-blackwall-theme |
-| Bliss | mishonki3/omarchy-bliss-theme |
 | Blue Ridge Dark | hipsterusername/omarchy-blueridge-dark-theme |
 | bluedotrb | dotsilva/omarchy-bluedotrb-theme |
 | Boring | geohot/omarchy-boring-theme |
 | Brutalism | bjornramberg/omarchy-brutalism-theme |
 | C64 | scar45/omarchy-c64-theme |
 | Caroline Skyline | OldJobobo/omarchy-caroline-skyline-theme |
-| Catppu Mocha | ankur311sudo/Catppu_Mocha |
 | Catppuccin Mocha | KidDogDad/omarchy-catppuccin-mocha-theme |
 | Catppuccin Mocha Dark | Luquatic/omarchy-catppuccin-dark |
 | Cattpuccin Glass | Luquatic/omarchy-catppuccin-glass |
@@ -768,7 +749,6 @@ Browse and install 252 community-made themes directly from the TUI. Themes are s
 | Duskwire | Grey-007/duskwire |
 | Dustyfog | atif-1402/omarchy-dustyfog-theme |
 | Eldritch | eldritch-theme/omarchy |
-| Eldritch Official | eldritch-theme/omarchy-eldritch-theme |
 | Elysian | bjarneo/omarchy-elysian-theme |
 | Ember n Ash | Hydradevx/omarchy-ember-n-ash-theme |
 | Eva-01 | Ludurn/omarchy-eva01-theme |
@@ -795,12 +775,10 @@ Browse and install 252 community-made themes directly from the TUI. Themes are s
 | Greek Noir | HANCORE-linux/omarchy-greek-noir-theme |
 | Green City | zillamtt/omarchy-green-city |
 | Green Garden | kalk-ak/omarchy-green-garden-theme |
-| Green Hakkar | joaquinmeza/omarchy-hakker-green-theme |
 | Grimdark Solarized | OldJobobo/omarchy-grimdark-solarized-theme |
 | Gruber Darker | celsobenedetti/omarchy-gruber-darker |
 | Gruber Tsoding | davide-ferrara/omarchy-gruberdark-tsoding-theme |
 | Grudark | zillamtt/omarchy-grudark |
-| Gruvu | ankur311sudo/gruvu |
 | Gruvy Glass | signaldirective/gruvy-glass |
 | GTA | jordan-ops/omarchy-GTA-theme |
 | Hakkar Green | JonasAllenCodes/omarchy-hakkar-green-better-contrast-theme |
@@ -919,7 +897,6 @@ Browse and install 252 community-made themes directly from the TUI. Themes are s
 | Terramour | atif-1402/omarchy-terramour-theme |
 | The Greek | HANCORE-linux/omarchy-thegreek-theme |
 | Tokyo Night OLED | Justin-De-Sio/omarchy-tokyoled-theme |
-| Torrentz Hydra | monoooki/omarchy-torrentz-hydra-theme |
 | Tycho | leonardobetti/omarchy-tycho |
 | Type17 | atif-1402/omarchy-type17-theme |
 | Van Gogh | Nirmal314/omarchy-van-gogh-theme |
@@ -946,13 +923,15 @@ Browse and install 252 community-made themes directly from the TUI. Themes are s
 Creates a timestamped archive (`~/omarchy-backup-YYYYMMDD_HHMMSS.tar.gz`) of your Omarchy configuration directories:
 
 - `~/.config/hypr/`
-- `~/.config/waybar/`
-- `~/.config/mako/`
 - `~/.config/omarchy/`
-- `~/.config/walker/`
+- `~/.config/uwsm/`
+- `~/.config/fastfetch/`
 - `~/.config/alacritty/`
 - `~/.config/kitty/`
 - `~/.config/ghostty/`
+- `~/.config/foot/`
+
+Directories that don't exist are skipped.
 
 Also generates `~/restore-omarchy-config.sh` — a self-contained script to restore from any previous backup. Symlinks are followed so the actual file content is preserved in the backup.
 
@@ -993,10 +972,10 @@ Adds an "A La Carchy" entry to the Omarchy launcher menu (SUPER+ALT+SPACE) so yo
 
 | Option | Description |
 |--------|-------------|
-| Add | Creates `~/.config/omarchy/extensions/menu.sh` with menu overrides |
-| Remove | Removes the managed block (deletes the file if empty) |
+| Add | Adds an `alacarchy` entry to `~/.config/omarchy/extensions/omarchy-menu.jsonc` (managed block) |
+| Remove | Removes the managed block |
 
-The extension file is generated at runtime by reading the installed `omarchy-menu` script directly, preserving all icons and menu entries. It uses Omarchy's built-in extension mechanism (`~/.config/omarchy/extensions/menu.sh`) which is sourced after the default menu functions, so the overrides take effect immediately.
+The entry launches this checkout when A La Carchy was run from a file, or the published one-liner otherwise. The menu is refreshed immediately with `omarchy menu refresh`.
 
 ## Safety Features
 
@@ -1059,31 +1038,24 @@ The script can remove the following Omarchy webapps (stored as `.desktop` files 
 
 ## Configuration Files Modified
 
-The script modifies the following Omarchy configuration files (with automatic backups):
+All edits to shared config files live in marked blocks (`-- >>> a-la-carchy <name>` … `-- <<< a-la-carchy <name>`), so they can be updated or removed cleanly. A timestamped backup is taken before each change. Files under `$OMARCHY_PATH` (`/usr/share/omarchy`) are only read, never modified.
 
-| File | Purpose |
-|------|---------|
-| `~/.config/hypr/monitors.conf` | Monitor scaling, multi-monitor positions, laptop auto-off exec-once, power profile exec-once |
-| `~/.config/hypr/bindings.conf` | Keybindings (toggles and keybind editor overrides) |
-| `~/.config/hypr/looknfeel.conf` | Rounded corners, window gaps, Hyprland General/Decoration/Gestures settings |
-| `~/.config/hypr/hyprlock.conf` | Rounded corners on lock screen password input |
-| `~/.config/hypr/input.conf` | Compose key, Alt/Super swapping, Hyprland Input settings |
+| File | Used for |
+|------|----------|
+| `~/.config/hypr/bindings.lua` | Keybinding toggles, Themarchy keybind, keybind editor overrides |
+| `~/.config/hypr/monitors.lua` | Monitor scale variables, multi-monitor layout, primary monitor workspace rules |
+| `~/.config/hypr/looknfeel.lua` | Rounded corners, window gaps, transparency, Hyprland General/Decoration/Gestures settings |
+| `~/.config/hypr/input.lua` | Compose key, Alt/Super swap, Hyprland Input settings |
+| `~/.config/hypr/autostart.lua` | Laptop auto-off watcher and power profile startup hooks |
 | `~/.config/hypr/scripts/themarchy.sh` | Themarchy standalone script (created by Themarchy section) |
 | `~/.config/hypr/scripts/laptop-display-auto.sh` | Laptop auto-off watcher script (created/removed by toggle) |
 | `~/.config/hypr/scripts/power-profile-default.sh` | Power profile startup script (sets default profile on login) |
-| `~/.config/hypr/scripts/omarchy-battery-limit.sh` | Battery limit helper for walker power menu (uses pkexec, created/removed by battery limit) |
-| `/etc/udev/rules.d/99-battery-charge-limit.rules` | Battery charge limit persistence (created/removed by battery limit) |
-| `~/.config/waybar/config.jsonc` | Clock format, tray icons, battery charge limit tooltip |
-| `~/.config/waybar/style.css` | Rounded corners on waybar tooltips |
-| `~/.config/swayosd/style.css` | Rounded corners on volume/brightness overlay |
+| `~/.config/hypr/scripts/omarchy-battery-limit.sh` | Battery limit helper for the Omarchy menu (uses pkexec, created/removed by battery limit) |
+| `~/.config/omarchy/shell.json` | Bar tweaks: tray, logo, update icon, clock format/date, window title |
+| `~/.config/omarchy/extensions/omarchy-menu.jsonc` | Menu shortcut and battery limit picker |
 | `~/.config/uwsm/default` | Screenshot/recording directories |
-| `~/.local/share/omarchy/default/walker/themes/omarchy-default/style.css` | Rounded corners, transparency on Walker launcher/menus |
-| `~/.local/share/omarchy/default/mako/core.ini` | Rounded corners on notifications |
-| `~/.local/share/omarchy/default/hypr/windows.conf` | Window transparency (global opacity rule) |
-| `~/.local/share/omarchy/default/hypr/apps/browser.conf` | Browser transparency (chromium/firefox opacity rules) |
-| `~/.local/share/omarchy/default/hypr/bindings/tiling-v2.conf` | Close window binding |
-| `~/.config/omarchy/extensions/menu.sh` | Menu shortcut (A La Carchy entry in Omarchy menu) |
-| `~/.local/share/omarchy/default/hypr/bindings/*.conf` | Read by keybind editor (not modified) |
+| `~/.local/state/omarchy/toggles/suspend-off` | Suspend availability in the system menu |
+| `$OMARCHY_PATH/default/hypr/bindings/*.lua` | Read by keybind editor (not modified) |
 
 ## Troubleshooting
 
