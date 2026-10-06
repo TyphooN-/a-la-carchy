@@ -2,7 +2,8 @@
 """Read-only Hermes Codex quotas. Stdlib only; never refreshes or selects logins.
 
 One bounded OAuth JSON snapshot, a fixed HTTPS GET per unique principal, and an
-atomic private display record OUTSIDE Omarchy's usage/sync/account registries.
+atomic private display record. Optional --usage-dir publishes two read-only
+scanner records; no default scanner writes and no native account registration.
 Tokens exist in memory and a private worker pipe, never argv, files or output.
 """
 import argparse
@@ -22,12 +23,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 
 MAX_AUTH_BYTES = 4 * 1024 * 1024
 MAX_RECORD_BYTES = 128 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024
 MAX_ACCOUNTS = 8
 MAX_TOKEN_BYTES = 32768
+MAX_SUBJECT_BYTES = 1024
 WORKER_TIMEOUT = 12
 AUTH_NAMESPACE = 'https://api.openai.com/auth'
 PLANS = {'free', 'plus', 'pro', 'team', 'business', 'enterprise', 'edu'}
@@ -35,7 +38,9 @@ REASONS = {'auth': 'Hermes login unavailable — manage credentials in Hermes',
            'expired': 'Token expired — refresh login in Hermes',
            'network': 'Quota check unavailable', 'quota': 'Quota fields unavailable',
            'initial': 'Quotas not checked yet', 'busy': 'A quota check is already running',
-           'state': 'Private quota state unavailable'}
+           'state': 'Private quota state unavailable',
+           'publication': 'Quotas collected but Agents publication failed — review the explicit destination',
+           'publication-recovery': 'Agents publication interrupted — preserve files for manual recovery'}
 
 
 class Unavailable(Exception):
@@ -46,7 +51,11 @@ class Unavailable(Exception):
 
 
 def number(value):
-    return type(value) in (int, float) and math.isfinite(value)
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        # Bounded JSON can still contain an integer beyond float range.
+        return False
 
 
 def read_json(path, maximum):
@@ -86,6 +95,13 @@ def header_value(value):
     return isinstance(value, str) and bool(re.fullmatch(r'[A-Za-z0-9_.:@-]{1,256}', value))
 
 
+def opaque_subject(value):
+    # Subject is hashed, NEVER put into a header or a display record. Auth0's
+    # pipe-separated subjects are valid; header syntax is the wrong contract.
+    return (isinstance(value, str) and 0 < len(value.encode('utf-8')) <= MAX_SUBJECT_BYTES
+            and not any(c.isspace() or unicodedata.category(c)[0] in 'CZ' for c in value))
+
+
 def identity(token):
     """Unverified claims are identity hints ONLY; the server authenticates GETs.
 
@@ -101,7 +117,7 @@ def identity(token):
         workspace, subject = auth.get('chatgpt_account_id'), claims.get('sub')
         expiry = claims.get('exp')
         residency = auth.get('chatgpt_data_residency') or auth.get('chatgpt_compute_residency') or ''
-        if not header_value(workspace) or not header_value(subject) or not number(expiry) or \
+        if not header_value(workspace) or not opaque_subject(subject) or not number(expiry) or \
                 (residency and not header_value(residency)):
             raise ValueError
         key = hashlib.sha256(json.dumps([workspace, subject], separators=(',', ':')).encode()).hexdigest()
@@ -294,7 +310,145 @@ def publish(state, record):
     return True
 
 
-def run_once(home, state, initialize=False):
+PUBLICATION_MANIFEST = '.hermes-codex-publication'
+PUBLICATION_LOCK = '.hermes-codex-publication.lock'
+
+
+def account_records(record):
+    """Only two display slots; account hashes follow current pool order."""
+    accounts = record.get('accounts')
+    if not isinstance(accounts, list) or len(accounts) > 2: raise Unavailable('publication')
+    result = {}
+    for i, raw in enumerate(accounts, 1):
+        clean = sanitize_old(raw)
+        if not clean: raise Unavailable('publication')
+        status = raw.get('usageStatusText', '')
+        if status not in ('', *REASONS.values()): raise Unavailable('publication')
+        name = 'codex-hermes-' + str(i)
+        value = {'schemaVersion': 1, 'id': name, 'name': f'Codex (Hermes {i})',
+                 'principalId': clean['id'], 'readOnly': True, 'ready': True,
+                 'hasLocalStats': False, 'hasPromptStats': False,
+                 'tierLabel': clean['plan'] or 'Hermes',
+                 'limits': [{**{k: w[k] for k in ('label', 'title', 'percent')},
+                             'resetsAt': w['resetAt']} for w in clean['limits']],
+                 'limitsStale': raw.get('stale') is not False,
+                 'limitsFetchedAt': clean['fetchedAt'],
+                 'usageStatusText': status, 'authHelpText': status}
+        result[name + '.json'] = (json.dumps(value, allow_nan=False, separators=(',', ':')) + '\n').encode()
+    return result
+
+
+def publication_directory(path):
+    """Walk no-follow directory FDs, including parents; never resolve a link."""
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for part in Path(path).absolute().parts[1:]:
+            if part in ('.', '..'): raise Unavailable('publication')
+            try: os.mkdir(part, 0o700, dir_fd=fd)
+            except FileExistsError: pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd); fd = child
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+            raise Unavailable('publication')
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def publication_read(fd, name):
+    try: file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)
+    except FileNotFoundError: return None
+    with os.fdopen(file_fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_size > MAX_RECORD_BYTES:
+            raise Unavailable('publication')
+        data = stream.read(MAX_RECORD_BYTES+1)
+    if len(data) > MAX_RECORD_BYTES: raise Unavailable('publication')
+    return data
+
+
+def publication_temp(fd, data):
+    name = '.codex-' + os.urandom(16).hex()
+    file_fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=fd)
+    try:
+        with os.fdopen(file_fd, 'wb') as stream:
+            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+    except BaseException:
+        os.unlink(name, dir_fd=fd)
+        raise
+    return name
+
+
+def publish_accounts(destination, record):
+    """Private atomic files, ownership hashes, checked rollback, no auth data.
+
+    A batch is NOT an atomic multi-file transaction for scanner readers. All
+    files are prepared first; ordinary partial failures roll back. A process
+    death or a non-cooperating concurrent writer fails closed on the next run.
+    Unregistered legacy/manual records are preserved, never adopted by name.
+    """
+    desired = account_records(record)
+    fd = None
+    try:
+        fd = publication_directory(destination)
+        lock_fd = os.open(PUBLICATION_LOCK, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600, dir_fd=fd)
+        with os.fdopen(lock_fd, 'wb') as lock:
+            info = os.fstat(lock.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+                raise Unavailable('publication')
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            manifest_before = publication_read(fd, PUBLICATION_MANIFEST)
+            owned = {}
+            if manifest_before is not None:
+                meta = json.loads(manifest_before)
+                owned = meta.get('files') if isinstance(meta, dict) and meta.get('version') == 1 else None
+                if not isinstance(owned, dict) or any(not re.fullmatch(r'codex-hermes-[1-8]\.json', n)
+                        or not isinstance(h, str) or not re.fullmatch(r'[a-f0-9]{64}', h) for n, h in owned.items()):
+                    raise Unavailable('publication')
+            before = {n: publication_read(fd, n) for n in sorted(set(owned) | set(desired))}
+            for n, data in before.items():
+                if data is not None and owned.get(n) != hashlib.sha256(data).hexdigest():
+                    raise Unavailable('publication')
+            manifest = (json.dumps({'version': 1, 'files': {n: hashlib.sha256(d).hexdigest() for n, d in desired.items()}},
+                                   sort_keys=True, separators=(',', ':')) + '\n').encode()
+            before[PUBLICATION_MANIFEST] = manifest_before
+            changes = desired | {PUBLICATION_MANIFEST: manifest}
+            staged, applied = {}, []
+            try:
+                for n, data in changes.items(): staged[n] = publication_temp(fd, data)
+                for n in sorted(set(owned) | set(desired)) + [PUBLICATION_MANIFEST]:
+                    if publication_read(fd, n) != before[n]: raise Unavailable('publication')
+                    if n in changes:
+                        os.replace(staged[n], n, src_dir_fd=fd, dst_dir_fd=fd)
+                        del staged[n]
+                    elif before[n] is not None: os.unlink(n, dir_fd=fd)
+                    else: continue
+                    applied.append(n)
+                os.fsync(fd)
+            except (OSError, Unavailable):
+                for n in reversed(applied):
+                    if publication_read(fd, n) != changes.get(n): raise Unavailable('publication-recovery')
+                    if before[n] is None: os.unlink(n, dir_fd=fd)
+                    else:
+                        temp = publication_temp(fd, before[n])
+                        try: os.replace(temp, n, src_dir_fd=fd, dst_dir_fd=fd)
+                        finally:
+                            try: os.unlink(temp, dir_fd=fd)
+                            except FileNotFoundError: pass
+                os.fsync(fd)
+                raise Unavailable('publication') from None
+            finally:
+                for temp in staged.values(): os.unlink(temp, dir_fd=fd)
+        return True
+    except Unavailable: raise
+    except (OSError, ValueError, TypeError, RecursionError): raise Unavailable('publication') from None
+    finally:
+        if fd is not None: os.close(fd)
+
+
+def run_once(home, state, initialize=False, usage_dir=None):
     private_state(state)
     fd = os.open(state/'collector.lock', os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     with os.fdopen(fd, 'wb') as lock:
@@ -319,6 +473,8 @@ def run_once(home, state, initialize=False):
                         'readOnly': True, 'active': False, 'stale': True,
                         'usageStatusText': REASONS['auth'], 'authHelpText': REASONS['auth']})
         publish(state, record)
+
+        if usage_dir is not None: publish_accounts(usage_dir, record)
         return True
 
 
@@ -327,6 +483,7 @@ def main():
     parser.add_argument('--hermes-home', type=Path, default=Path(os.environ.get('HERMES_HOME') or Path.home()/'.hermes'))
     parser.add_argument('--state-dir', type=Path, default=Path(os.environ.get('XDG_STATE_HOME') or Path.home()/'.local/state')/'omarchy/hermes-codex')
     parser.add_argument('--initialize', action='store_true', help='Publish an unknown placeholder; no auth read or network')
+    parser.add_argument('--usage-dir', type=Path, help='Explicit Agents scanner destination; omitted means private state only')
     parser.add_argument('--quota-worker', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     try:
@@ -336,7 +493,7 @@ def main():
             result = http_quota(token, identity(token), time.time())
             print(json.dumps(result, allow_nan=False))
         else:
-            run_once(args.hermes_home, args.state_dir, args.initialize)
+            run_once(args.hermes_home, args.state_dir, args.initialize, args.usage_dir)
         return 0
     except Unavailable as exc:
         if args.quota_worker: print(json.dumps({'error': exc.reason}))

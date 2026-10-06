@@ -38,6 +38,10 @@ CLONE_WITHOUT_GROK = ('the staged ' + CLONE_ID + ' clone in use has no Grok tab;
 ENTRY_KEY = '_alaCarchyAgents'
 FEATURES = ('local', 'grok')
 UNIT = 'local-router-stats.service'
+TOOL_FILES = ('agents-clone/manage.py', 'agents-clone/upgrade.py',
+              'local-router-stats/stage_plugin.py', 'local-router-stats/collector.py',
+              'local-router-stats/local-router-stats.service', 'grok-usage/stage_plugin.py',
+              'grok-usage/collector.py', 'hermes-codex-usage/collector.py')
 EXTRAS = Path(__file__).resolve().parents[1]
 MAX_CONFIG = 1024 * 1024
 BLOCK_START = '# >>> a-la-carchy grok-usage (managed by A La Carchy)'
@@ -73,6 +77,13 @@ class Paths:
         self.plugins = args.plugins or home/'.config/omarchy/plugins'
         self.clone = self.plugins/CLONE_ID
         self.registry = share/'managed-files.json'
+        self.tools = share
+        self.bridge_collector = share/'hermes-codex-usage/collector.py'
+        self.bridge_unit = config/'systemd/user/hermes-codex-usage.service'
+        self.bridge_timer = self.bridge_unit.with_suffix('.timer')
+        self.bridge_home = getattr(args, 'hermes_home', None) or Path(os.environ.get('HERMES_HOME') or home/'.hermes')
+        self.bridge_state = state/'omarchy/hermes-codex'
+        self.bridge_usage = state/'omarchy/agents/usage'
         # The unit template runs %h/.local/share/a-la-carchy/..., so keep HOME-based.
         self.local_collector = share/'local-router-stats/collector.py'
         self.unit = config/'systemd/user'/UNIT
@@ -162,39 +173,49 @@ class Registry:
 
 # ----------------------------------------------------------------- clone
 
+def plugin_snapshot(root):
+    """Complete bounded no-follow clone contents; no ignored special nodes."""
+    root = Path(root).absolute()
+    try:
+        local = load('alc_clone_inventory', EXTRAS/'local-router-stats/stage_plugin.py')
+        paths = local.source_files(root, require_nonempty_dirs=True, owned=True)
+        return {p.relative_to(root).as_posix(): local.source_bytes(p, owned=True) for p in paths}
+    except (OSError, ValueError):
+        raise Refused('unsafe Agents clone filesystem; preserved') from None
+
+
 def plugin_files(root):
-    files = {}
-    for path in sorted(root.rglob('*')):
-        if path.is_symlink():
-            raise Refused('symlinks inside the Agents clone are refused')
-        if path.is_file() and path.relative_to(root).as_posix() != 'manifest.json':
-            files[path.relative_to(root).as_posix()] = digest(path.read_bytes())
-    return files
+    return {n: digest(data) for n, data in plugin_snapshot(root).items() if n != 'manifest.json'}
 
 
-def clone_info(target):
-    """What an UNMODIFIED managed clone is, or None for anything else.
+def clone_info(target, registry=None):
+    """Validate clone shape, and ownership when a trusted registry is supplied.
 
-    A marker alone proves nothing: every file must be listed in the clone's own
-    manifest with a matching digest, and nothing unlisted may be present, so a
-    foreign or edited plugin at this path is never mistaken for ours (and never
-    replaced).
+    The editable manifest alone is not an ownership witness. Mutation callers
+    must supply the registry or use the guarded upgrade's external preimage.
     """
     if not target.is_dir() or target.is_symlink():
         return None
     try:
-        manifest_path = target/'manifest.json'
-        if regular_or_absent(manifest_path) is False:
+        contents = plugin_snapshot(target)
+        if 'manifest.json' not in contents:
             return None
-        manifest = json.loads(manifest_path.read_text())
+        manifest = json.loads(contents['manifest.json'])
         meta = manifest.get('omarchy', {})
         managed = meta.get('managedFiles')
         if (manifest.get('id') != CLONE_ID or meta.get('clonedFrom') != SOURCE_ID or meta.get('alaCarchy') not in MARKS
                 or manifest.get('kinds') != ['bar-widget'] or manifest.get('entryPoints', {}).get('barWidget') != 'Panel.qml'
                 or not isinstance(managed, dict) or not managed or any('..' in Path(name).parts for name in managed)):
             return None
-        if plugin_files(target) != managed or not all(name in managed for name in ('Main.qml', 'Panel.qml', 'Agent.qml')):
+        actual = {n: digest(data) for n, data in contents.items()}
+        if ({n: h for n, h in actual.items() if n != 'manifest.json'} != managed
+                or not all(name in managed for name in ('Main.qml', 'Panel.qml', 'Agent.qml'))):
             return None
+        if registry is not None:
+            prefix = str(target) + '/'
+            recorded = {n[len(prefix):]: h for n, h in registry.files.items() if n.startswith(prefix)}
+            if recorded != actual:
+                return None
         source = meta.get('alaCarchySource')
         return {'features': MARKS[meta['alaCarchy']], 'source': source if isinstance(source, str) else ''}
     except (OSError, ValueError, AttributeError, TypeError, Refused):
@@ -222,8 +243,14 @@ def clone_plan(paths):
         raise Refused('installed Agents source is unsupported or unreadable; nothing staged') from None
 
 
-def stage_clone(paths, plan, replace):
-    """Create the managed clone, or swap an unused, unmodified one for a fresh build."""
+def stage_clone(paths, plan, replace, registry=None):
+    """Create a new clone, or transactionally rebuild an unused owned clone."""
+    if replace:
+        helper = load('alc_agents_rebuild', EXTRAS/'agents-clone/upgrade.py')
+        try:
+            return helper.upgrade(paths, unused=True, plan=plan, registry=registry)['clone']
+        except helper.manage.Refused as exc:
+            raise Refused(str(exc)) from None
     local, rendered, _ = plan
     if any(parent.is_symlink() for parent in paths.clone.absolute().parents):
         raise Refused('symlinked plugin directory parents are refused')
@@ -241,16 +268,9 @@ def stage_clone(paths, plan, replace):
             raise Refused('unexpected staged clone provenance; nothing staged')
         manifest['omarchy']['managedFiles'] = plugin_files(staged)
         (staged/'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-        if replace:
-            previous = scratch/'previous'
-            os.rename(paths.clone, previous)
-            try:
-                os.rename(staged, paths.clone)
-            except OSError:
-                os.rename(previous, paths.clone)  # put the old build back
-                raise
-        else:
-            os.rename(staged, paths.clone)
+        trusted_hashes = plugin_files(staged) | {'manifest.json': digest((staged/'manifest.json').read_bytes())}
+        os.rename(staged, paths.clone)
+        return trusted_hashes
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -594,7 +614,7 @@ def check(paths, feature, enabled):
         return False
     listed = entry is not None and feature in entry[ENTRY_KEY]['features']
     if enabled:
-        info = clone_info(paths.clone) if listed else None
+        info = clone_info(paths.clone, Registry(paths.registry)) if listed else None
         return info is not None and feature in info['features'] and feature_installed(paths, feature)
     return not listed and feature_absent(paths, feature)
 
@@ -610,7 +630,7 @@ def enable(paths, feature):
         raise Refused('ambiguous Agents entries in the bar; preserved')
     info = None
     if paths.clone.exists() or paths.clone.is_symlink():
-        info = clone_info(paths.clone)
+        info = clone_info(paths.clone, Registry(paths.registry))
         if info is None:
             raise Refused(CLONE_ID + ' exists but is not an unmodified managed clone; preserved')
     # A clone is a frozen copy of the packaged plugin. While no tab is enabled
@@ -640,7 +660,12 @@ def enable(paths, feature):
             raise Refused('existing grok-usage collector differs from the managed copy; preserved')
     # Every refusal above happens before anything is written.
     if plan:
-        stage_clone(paths, plan, replace=info is not None)
+        clone_hashes = stage_clone(paths, plan, replace=info is not None, registry=registry)
+        if info is None:
+            prefix = str(paths.clone) + '/'
+            registry.files = {n: h for n, h in registry.files.items() if not n.startswith(prefix)}
+            registry.files.update({str(paths.clone/n): h for n, h in clone_hashes.items()})
+            registry.save()
         say(('Rebuilt ' if info else 'Staged ') + CLONE_ID + ' (' + plan[1]['manifest']['name'] + ') from the installed Agents plugin')
     elif entry is not None and current_source(paths) not in ('', info['source']):
         say('Note: ' + CLONE_ID + ' was built from a different Omarchy Agents version and is in use, so it was kept as is.')
@@ -720,16 +745,62 @@ def disable(paths, feature):
     say('History, collector programs and the ' + CLONE_ID + ' plugin files were kept.')
 
 
+def bridge_units(paths):
+    # ExecStart is systemd syntax, not a shell command: escape expansion too.
+    def argument(value):
+        text = str(value)
+        if not text or any(ord(c) < 32 or ord(c) == 127 for c in text):
+            raise Refused('invalid bridge unit pathname')
+        return json.dumps(text.replace('%', '%%').replace('$', '$$'), ensure_ascii=False)
+    command = ' '.join(argument(v) for v in ('/usr/bin/python3', '-B', paths.bridge_collector,
+                       '--hermes-home', paths.bridge_home, '--state-dir', paths.bridge_state,
+                       '--usage-dir', paths.bridge_usage))
+    service = ('[Unit]\nDescription=Read-only Hermes Codex quota publication\n\n[Service]\n'
+               'Type=oneshot\nUMask=0077\nExecStart=' + command + '\n')
+    timer = ('[Unit]\nDescription=Read-only Hermes Codex quota polling\n\n[Timer]\n'
+             'OnStartupSec=2min\nOnUnitActiveSec=5min\nUnit=hermes-codex-usage.service\n\n'
+             '[Install]\nWantedBy=timers.target\n')
+    return [(paths.bridge_unit, service.encode()), (paths.bridge_timer, timer.encode())]
+
+
+def install_tools(paths, bridge=False):
+    helper = load('alc_agents_install', EXTRAS/'agents-clone/upgrade.py')
+    replacements = [(paths.tools/name, checkout_bytes(name)) for name in TOOL_FILES]
+    if bridge: replacements += bridge_units(paths)
+    try:
+        result = helper.install_files(paths, replacements)
+    except helper.manage.Refused as exc:
+        raise Refused(str(exc)) from None
+    say('Managed Agents tools installed; no collection, layout or activation changes.')
+    if result['backup']: say('Private backup: ' + result['backup'])
+
+
+def upgrade(paths, preimage_path=None):
+    helper = load('alc_agents_upgrade', EXTRAS/'agents-clone/upgrade.py')
+    try:
+        expected = None
+        if preimage_path is not None:
+            expected = json.loads(helper.read_file(preimage_path)[0])
+        result = helper.upgrade(paths, expected)
+    except helper.manage.Refused as exc:
+        raise Refused(str(exc)) from None
+    say('Upgraded ' + CLONE_ID + '; private backup: ' + result['backup'])
+    say('No service or shell activation performed. Reload only at an authorized boundary.')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, default=Path('/usr/share/omarchy/shell/plugins/agents'))
     parser.add_argument('--shell', type=Path, required=True)
     parser.add_argument('--plugins', type=Path)
+    parser.add_argument('--hermes-home', type=Path, help='Install bridge only: explicit Hermes profile directory (no auth read)')
     modes = parser.add_mutually_exclusive_group(required=True)
-    for mode in ('enable', 'disable', 'check-enabled', 'check-disabled'):
+    for mode in ('enable', 'disable', 'upgrade', 'install-tools', 'install-bridge', 'check-enabled', 'check-disabled'):
         modes.add_argument('--' + mode, action='store_const', dest='mode', const=mode)
+    parser.add_argument('--preimage', type=Path, help='Upgrade only: exact caller-authorized task preimage JSON; no force override')
     parser.add_argument('feature', choices=FEATURES)
     args = parser.parse_args()
+    if args.preimage is not None and args.mode != 'upgrade': parser.error('--preimage requires --upgrade')
     paths = Paths(args)
     if args.mode.startswith('check-'):
         try:
@@ -737,7 +808,9 @@ def main():
         except Exception:
             return 1  # a state that cannot be read is neither enabled nor disabled
     try:
-        (enable if args.mode == 'enable' else disable)(paths, args.feature)
+        if args.mode == 'upgrade': upgrade(paths, args.preimage)
+        elif args.mode in ('install-tools', 'install-bridge'): install_tools(paths, args.mode == 'install-bridge')
+        else: (enable if args.mode == 'enable' else disable)(paths, args.feature)
         return 0
     except Refused as exc:
         say('Refused: ' + str(exc))

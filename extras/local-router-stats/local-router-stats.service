@@ -1,0 +1,12 @@
+# Staged template only. Install collector.py in the path below before enabling.
+[Unit]
+Description=Read-only local llama.cpp sampled token statistics
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/share/a-la-carchy/local-router-stats/collector.py --run --publish
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
