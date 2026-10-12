@@ -673,8 +673,11 @@ class LimitsLayoutNativeGrok(Fixture):
         panel = (self.clone/'Panel.qml').read_text()
         self.assertIn('/omarchy/local-router/agents/local.json', main)
         self.assertIn('name.slice(-5) === ".json" && name !== "local.json" && name !== "codex.json") ids.push', main)
-        for text in (main, panel):
-            self.assertNotIn('grok', text.lower(), 'the first-party Grok record is not filtered, renamed or replaced')
+        self.assertNotIn('grok', main.lower(), 'native Grok admission must not be filtered, renamed or shadowed')
+        self.assertIn('function grokQuotaFresh(p)', panel)
+        self.assertIn('function grokUsageText(p)', panel)
+        self.assertNotIn('grokObservedAgent', main)
+        self.assertNotIn('grokObservedRecordPath', main)
         self.assertIn('function localRouterText(p)', panel)
         self.assertIn('if (item && item.providerId === "local") return ""', panel)
         self.assertIn('if (p.providerId === "local") continue', panel)

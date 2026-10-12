@@ -189,6 +189,103 @@ def transform_panel_limits(text):
                         'Qt.resolvedUrl("assets/" + iconId + ".svg")')
     return replace_once(text, '  function planLabel(p) {', LIMITS_LOCAL_FUNCTION + '  function planLabel(p) {')
 
+GROK_QUOTA_FUNCTIONS = '''  // A reset forecast is not an authenticated quota measurement.
+  function grokQuotaFresh(p) {
+    if (!p || p.providerId !== "grok") return true
+    if (p.limitsStale === true) return false
+    var fetched = Number(p.limitsFetchedAt)
+    var interval = Number(usage.setting("refreshIntervalSec", 900))
+    if (!isFinite(interval) || interval < 30 || interval > 3600) interval = 900
+    if (!isFinite(fetched) || fetched <= 0 || fetched > root.nowMs + 60000 || root.nowMs - fetched > Math.max(60, interval) * 2000)
+      return false
+    var list = p.limits || []
+    // QML modelData can expose a Qt sequence rather than a JS Array.
+    if (typeof list.length !== "number" || list.length <= 0 || list.length > 128) return false
+    for (var i = 0; i < list.length; i++) {
+      var entry = list[i] || {}
+      var reset = new Date(String(entry.resetsAt || "")).getTime()
+      if (typeof entry.percent !== "number" || !isFinite(entry.percent) || entry.percent < 0 || entry.percent > 1 || !isFinite(reset) || reset <= root.nowMs)
+        return false
+    }
+    return true
+  }
+
+  function grokQuotaText(p) {
+    if (!p || p.providerId !== "grok" || root.grokQuotaFresh(p)) return ""
+    var fetched = Number(p.limitsFetchedAt)
+    if (isFinite(fetched) && fetched > 0 && fetched <= root.nowMs + 60000)
+      return "Subscription quota stale · last successful reading " + new Date(fetched).toLocaleString()
+    return "Subscription quota unavailable · refresh Grok sign-in"
+  }
+
+  function grokAccountWindows(provider, account) {
+    var p = { limits: account ? account.limits || [] : [] }
+    if (provider && provider.providerId === "grok") {
+      p.providerId = "grok"
+      p.limitsStale = account ? account.stale === true : true
+      p.limitsFetchedAt = account ? account.fetchedAt : 0
+    }
+    return root.displayWindows(p)
+  }
+
+  function grokUsageText(p) {
+    if (!p || p.providerId !== "grok") return ""
+    var lines = []
+    var quota = root.grokQuotaText(p)
+    if (quota !== "") lines.push(quota)
+    var models = p.modelUsage
+    var ids = models && typeof models === "object" && !Array.isArray(models) ? Object.keys(models).sort() : []
+    if (ids.length === 0) {
+      lines.push(p.hasLocalStats === true ? "Native CLI history recorded · model counters unavailable" : "Native CLI token history unavailable (not zero usage)")
+      return lines.join("\\n")
+    }
+    lines.push("Native CLI recorded token history · not quota")
+    var fields = ["inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"]
+    var labels = ["In", "Out", "Cache read", "Cache creation"]
+    // Bound rendering only; the complete producer ledger stays unchanged.
+    for (var i = 0; i < Math.min(ids.length, 128); i++) {
+      var entry = models[ids[i]]
+      var parts = []
+      var valid = !!entry && typeof entry === "object" && !Array.isArray(entry)
+      for (var j = 0; valid && j < fields.length; j++) {
+        var n = entry[fields[j]] === undefined ? 0 : entry[fields[j]]
+        valid = typeof n === "number" && isFinite(n) && n >= 0 && Math.floor(n) === n && n <= 9007199254740991
+        if (valid) parts.push(labels[j] + " " + usage.formatTokenCount(n))
+      }
+      if (ids[i].length > 512) lines.push("Model label exceeds display bound · entry retained")
+      else lines.push(ids[i] + " · " + (valid ? parts.join(" · ") : "Counts unavailable"))
+    }
+    if (ids.length > 128) lines.push("Additional model entries retained: " + (ids.length - 128))
+    return lines.join("\\n")
+  }
+
+'''
+
+GROK_QUOTA_TEXT = '''    Text {
+      textFormat: Text.PlainText
+      visible: text !== ""
+      width: parent.width
+      text: root.grokUsageText(section.provider)
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.WrapAnywhere
+    }
+
+'''
+
+def transform_grok_panel(text):
+    """Native Grok only: retain real quotas, never roll expired data to zero."""
+    text = replace_once(text, '  function planLabel(p) {',
+                        GROK_QUOTA_FUNCTIONS + '  function planLabel(p) {')
+    text = replace_once(text, '  function limitWindows(p) {\n    if (!p) return []',
+                        '  function limitWindows(p) {\n    if (!p) return []\n'
+                        '    if (p.providerId === "grok" && !root.grokQuotaFresh(p)) return []')
+    text = replace_once(text, 'model: root.displayWindows({ limits: accountBlock.modelData.limits || [] })',
+                        'model: root.grokAccountWindows(section.provider, accountBlock.modelData)')
+    anchor = "  }\n\n  // A provider's mark, falling back to the bar glyph when it ships none."
+    return replace_once(text, anchor, GROK_QUOTA_TEXT + anchor)
+
 PANEL_LAYOUTS = (('limits', transform_panel_limits), ('tabs', transform_panel_tabs))
 
 def patch_panel(text):
@@ -297,6 +394,8 @@ def render(source, plugin_id):
         raise ValueError('only the packaged omarchy.agents implementation is supported')
     main = transform_main(source_bytes(source/'Main.qml').decode())
     layout, panel = patch_panel(source_bytes(source/'Panel.qml').decode())
+    if layout == 'limits' and 'grok' in native_providers(manifest):
+        panel = transform_grok_panel(panel)
     # As `omarchy plugin clone` does: built-in ids inside the QML stay, so the
     # shell keeps routing omarchy.agents IPC and settings through clonedFrom.
     manifest['id'] = plugin_id

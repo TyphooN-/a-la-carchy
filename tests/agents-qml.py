@@ -121,7 +121,8 @@ Item {
     (usage/'claude.json').write_text(json.dumps(subscription))
     # Dev-channel Grok is first-party: retain its real record contract beside Local.
     native_grok = dict(subscription, id='grok', name='Grok', tierLabel='X Premium',
-                       limits=[{'label': 'Weekly', 'percent': 0.75, 'resetsAt': ''}],
+                       limits=[{'label': 'Weekly', 'percent': 0.75, 'resetsAt': (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=7)).isoformat()}],
+                       limitsFetchedAt=dt.datetime.now(dt.timezone.utc).timestamp()*1000, limitsStale=False, hasLocalStats=False,
                        todayPrompts=0, todaySessions=0, todayTotalTokens=0, todayTokensByModel={},
                        recentDays=[], modelUsage={})
     (usage/'grok.json').write_text(json.dumps(native_grok))
@@ -277,6 +278,8 @@ ShellRoot {
         ids: list.map(function(p) { return p.providerId }),
         local: local,
         grok: list.filter(function(p) { return p.providerId === "grok" })[0],
+        grokWindows: panel.limitWindows(list.filter(function(p) { return p.providerId === "grok" })[0]),
+        grokText: panel.grokUsageText(list.filter(function(p) { return p.providerId === "grok" })[0]),
         allModelsText: panel.localRouterText({ todayTokensByModel: {"model-1": 1, "model-2": 2, "model-3": 3, "model-4": 4, "model-5": 5, "model-6": 6} }),
         localText: local ? panel.localRouterText(local) : null,
         localTrouble: local ? panel.otherTrouble(local) : null,
@@ -342,6 +345,8 @@ ShellRoot {
     assert result['grok']['providerName'] == 'Grok' and result['grok']['tierLabel'] == 'X Premium'
     assert result['grok']['limits'] == native_grok['limits'], result['grok']['limits']
     assert result['grok']['todayTotalTokens'] == 0
+    assert len(result['grokWindows']) == 1 and result['grokWindows'][0]['percent'] == 0.75
+    assert 'unavailable (not zero usage)' in result['grokText']
     assert 'Today by model: model-6 6 · model-5 5 · model-4 4 · model-3 3 · model-2 2 · model-1 1' in result['allModelsText'], result['allModelsText']
     assert '+2 more' not in result['allModelsText']
     assert 'Today — · last 7 days 7 tokens (1 of 2 days recorded)' in result['unknownTodayText'], result['unknownTodayText']
@@ -365,6 +370,7 @@ ShellRoot {
     # Rendering: the Local section shows its own lines, and its caveat text is
     # never drawn as (urgent) trouble the way a subscription's would be.
     texts = result['texts']
+    assert texts.count('Grok') == 1 and texts.count(result['grokText']) == 1, texts
     assert texts.count(result['localText']) == 1, texts
     assert 'Local' in texts and 'Llama.cpp router' in texts and 'Claude Code' in texts and 'Max' in texts, texts
     assert 'Grok' in texts and 'X Premium' in texts, texts

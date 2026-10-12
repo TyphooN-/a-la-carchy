@@ -149,6 +149,11 @@ Panel {
     return String(p && p.tierLabel || "")
   }
 
+  function limitWindows(p) {
+    if (!p) return []
+    return p.limits || []
+  }
+
   readonly property var summaryPhrases: {
     var week = 0
     for (var i = 0; i < providers.length; i++) {
@@ -177,7 +182,12 @@ Panel {
     Column {
       visible: !section.multi
     }
+    Repeater {
+      model: root.displayWindows({ limits: accountBlock.modelData.limits || [] })
+    }
   }
+
+  // A provider's mark, falling back to the bar glyph when it ships none.
 }
 '''
 
