@@ -167,9 +167,9 @@ console.log(JSON.stringify({recorded: format(record), unknown: format(unknown), 
                        text=True, capture_output=True, timeout=5)
     assert p.returncode == 0, p.stderr
     result = json.loads(p.stdout)
-    for value in ['fixture/grok-model', 'In 11', 'Out 5', 'Cache read 2', 'Cache creation 1', 'not quota']:
+    for value in ['fixture/grok-model', 'In 11', 'Out 5', 'Cache read 2', 'Cache creation 1', 'Recorded tokens']:
         assert value in result['recorded'], 'Native per-model ledger must be rendered separately: ' + value
-    assert 'unavailable' in result['unknown'].lower() and 'not zero' in result['unknown'].lower()
+    assert result['unknown'] == '', 'Unknown token history must not be displayed as recorded zero or repeated caveats'
     assert 'fixture-zero' in result['zero'] and 'In 0' in result['zero']
     print('PASS native model input/output/cache buckets retained; unknown distinct from measured zero')
 

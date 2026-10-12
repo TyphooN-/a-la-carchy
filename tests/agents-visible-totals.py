@@ -48,8 +48,9 @@ assert.equal(t.cloud.today.value, 11, 'Aggregate and accounts, Local, and duplic
 assert.equal(t.cloud.history.value, 20, 'History includes input/output/cache-read/cache-creation once');
 assert.equal(t.cloud.today.sources, 2); assert.equal(t.cloud.today.known, 1);
 assert.equal(t.local.today, 900); assert.equal(t.codex.history, 509, 'Native CLI must remain separately unattributed');
-assert.match(t.byProvider.claude, /unattributed/);
-assert.match(t.byProvider['codex-hermes-1'], /quota-only/);
+assert.match(t.byProvider.claude, /11 today/);
+assert.match(t.byProvider.claude, /20 recorded/);
+assert.equal(t.byProvider['codex-hermes-1'], '', 'Quota-only cards need no repeated token disclaimer');
 console.log('PASS aggregate once; Local and unattributed Codex separate; quota coverage explicit');
 let nativeClaude = ctx.recordedTokenCounters({id:'claude', hasLocalStats:true, todayTotalTokens:11,
   recentDays:[{date:'2026-10-12',messageCount:11}],modelUsage:{m:{inputTokens:11}}});
@@ -62,7 +63,7 @@ assert.equal(zero.cloud.today.value, 0); assert.equal(zero.cloud.today.known, 1)
 let unknown = run([quota, {providerId:'missing', todayTotalTokens:undefined}]);
 assert.equal(unknown.cloud.today.value, null); assert.equal(unknown.cloud.history.value, null);
 assert.equal(unknown.cloud.today.known, 0);
-assert.match(unknown.byProvider.missing, /not zero/);
+assert.equal(unknown.byProvider.missing, '', 'Unknown counters stay absent, not displayed as zero');
 console.log('PASS unavailable differs from recorded zero');
 let accounts = Array.from({length:137}, (_, i) => recorded('account-'+i, i, {label:'account '+i}));
 let grouped = run([{providerId:'family', providerName:'family', hasLocalStats:false, accounts}]);

@@ -79,6 +79,7 @@ with tempfile.TemporaryDirectory(prefix='ag-') as td:
         if path.name != 'KeyboardPanel.qml':
             (fixture/'Ui'/path.name).symlink_to(path)
     (fixture/'Ui/KeyboardPanel.qml').write_text('''import QtQuick
+import Quickshell
 // Test stand-in for the layer-shell popup: same API, plain Item.
 Item {
   id: root
@@ -93,13 +94,29 @@ Item {
   property bool open: false
   property Item focusTarget: null
   default property alias contentItem: contentHolder.children
+  property Component content: null
+  property bool contentRequested: false
+  readonly property Item loadedContent: contentLoader.item
+  readonly property real loadedContentHeight: loadedContent ? loadedContent.implicitHeight : 0
+  onOpenChanged: if (open && content) contentRequested = true
+  function ensureContent() { if (content) contentRequested = true; return contentLoader.item }
   function close() { if (owner && "close" in owner) owner.close(); else root.open = false }
   function fittedContentWidth(width, cap) { var d = Math.max(1, Number(width) || 1); return Math.round(Number(cap) > 0 ? Math.min(d, Number(cap)) : d) }
-  function fittedContentHeight(height, cap) { var d = Math.max(1, Number(height) || 1); return Math.round(Number(cap) > 0 ? Math.min(d, Number(cap)) : d) }
+  readonly property int availableCardHeight: Quickshell.env("ALACARCHY_SCREEN_CASE") === "short" ? 450 : 1400
+  function fittedContentHeight(height, cap) { var d = Math.max(1, Number(height) || 0); var maximum = Number(cap) > 0 ? Math.min(availableCardHeight, Number(cap)) : availableCardHeight; return Math.round(Math.min(d, maximum)) }
   function cappedContentHeight(height) { return Math.max(1, Number(height) || 1) }
   width: contentWidth
   height: contentHeight
-  Item { id: contentHolder; anchors.fill: parent }
+  Item {
+    id: contentHolder
+    anchors.fill: parent
+    Loader {
+      id: contentLoader
+      anchors.fill: parent
+      active: root.content !== null && (root.open || root.contentRequested)
+      sourceComponent: root.content
+    }
+  }
 }
 ''')
 
@@ -201,6 +218,9 @@ Item {
     bar_case = os.environ.get('ALACARCHY_BAR_CASE', 'horizontal')
     assert bar_case in ('horizontal', 'vertical')
     env['ALACARCHY_BAR_CASE'] = bar_case
+    screen_case = os.environ.get('ALACARCHY_SCREEN_CASE', 'tall')
+    assert screen_case in ('tall', 'short')
+    env['ALACARCHY_SCREEN_CASE'] = screen_case
     for name in EXPECTED_STUBS + FORBIDDEN_STUBS:
         assert shutil.which(name, path=env['PATH']) == str(bin_dir/name), 'a real ' + name + ' is reachable'
 
@@ -210,6 +230,8 @@ import "plugin" as Agents
 ShellRoot {
   id: root
   property bool reported: false
+  property bool panelOpenedForProof: false
+  property bool preOpenHeaderAbsent: false
   Agents.Main { id: admission; settings: ({ refreshIntervalSec: 3600 }) }
   QtObject {
     id: fixtureBar
@@ -258,6 +280,16 @@ ShellRoot {
     }
     return null
   }
+  function providerGeometry(item, body, out) {
+    if (!item || item.visible === false) return out
+    if (typeof item.providerIndex === "number" && item.provider && item.windows !== undefined) {
+      var p = item.mapToItem(body, 0, 0)
+      out.push({id: item.provider.providerId, y: p.y, height: item.height})
+    }
+    var children = item.children || []
+    for (var i = 0; i < children.length; i++) providerGeometry(children[i], body, out)
+    return out
+  }
   // Inspect the instantiated provider delegate, not a plain JS provider copy:
   // Repeater modelData converts nested limits to a Qt sequence.
   function shownMeters(item, out) {
@@ -284,12 +316,21 @@ ShellRoot {
     onTriggered: {
       var list = panel.providers
       if (!list || list.length < 5 || admission.enabledProviders.length < 5) return
+      if (!root.panelOpenedForProof) {
+        root.preOpenHeaderAbsent = namedItem(panel, "recordedTokenHeader") === null
+        root.panelOpenedForProof = true
+        panel.open()
+        return // build the native lazy content and allow one layout tick
+      }
       var local = null
       for (var i = 0; i < list.length; i++) if (list[i].providerId === "local") local = list[i]
       var texts = shownTexts(panel, [])
       if (!local || texts.indexOf("Local") < 0) return // sections are still being built
       root.reported = true
       var header = namedItem(panel, "recordedTokenHeader")
+      panel.close()
+      panel.open()
+      var headerRetainedOnReopen = header !== null && namedItem(panel, "recordedTokenHeader") === header
       var tokenBar = namedItem(panel, "recordedTokenBar")
       var body = namedItem(panel, "recordedTokenBody")
       var pinnedBefore = header ? shownTexts(header, []) : []
@@ -324,11 +365,16 @@ ShellRoot {
       console.log("AGENTS_QML_RESULT " + JSON.stringify({
         hermes: [h1, h2],
         recordedTotals: panel.recordedTotals,
+        preOpenHeaderAbsent: root.preOpenHeaderAbsent,
+        headerRetainedOnReopen: headerRetainedOnReopen,
         pinnedBefore: pinnedBefore,
         pinnedAfter: header ? shownTexts(header, []) : [],
         pinnedPlainText: header ? plainTexts(header) : false,
         pinnedGeometry: header ? {visible:header.visible, y:header.y, width:header.width, height:header.height,
-                                  bodyY:body ? body.y : -1, scrollY:body ? body.contentY : -1} : null,
+                                  bodyY:body ? body.y : -1, scrollY:body ? body.contentY : -1,
+                                  bodyHeight:body ? body.height : -1, bodyContent:body ? body.contentHeight : -1,
+                                  popupHeight:header.parent.height, inset:0} : null,
+        providerGeometry: body ? providerGeometry(panel, body, []) : [],
         barTokens: tokenBar ? {text:tokenBar.labelText, glyph:tokenBar.text, vertical:tokenBar.vertical,
                               paintedWidth:tokenBar.glyphPaintedWidth, texts:shownTexts(tokenBar, []),
                               visible:tokenBar.visible, width:tokenBar.width, height:tokenBar.height} : null,
@@ -426,10 +472,10 @@ ShellRoot {
     assert len(rendered['meters']) == 1, 'Grok Weekly meter missing: ' + repr(rendered)
     meter = rendered['meters'][0]
     assert meter['value'] == result['grokWindows'][0]['percent'] and meter['width'] > 0 and meter['height'] > 0, meter
-    assert 'unavailable (not zero usage)' in result['grokText']
-    assert 'Today by model: model-6 6 · model-5 5 · model-4 4 · model-3 3 · model-2 2 · model-1 1' in result['allModelsText'], result['allModelsText']
+    assert result['grokText'] == '', 'A fresh quota-only Grok card needs no extra disclaimer'
+    assert 'Today: model-6 6 · model-5 5 · model-4 4 · model-3 3 · model-2 2 · model-1 1' in result['allModelsText'], result['allModelsText']
     assert '+2 more' not in result['allModelsText']
-    assert 'Today — · last 7 days 7 tokens (1 of 2 days recorded)' in result['unknownTodayText'], result['unknownTodayText']
+    assert result['unknownTodayText'] == 'No token data', result['unknownTodayText']
     local = result['local']
     assert local['providerName'] == 'Local' and local['tierLabel'] == 'llama.cpp router'
     assert local['todayTotalTokens'] == record['todayTotalTokens'], local['todayTotalTokens']
@@ -440,17 +486,15 @@ ShellRoot {
     assert result['localTrouble'] == '' and result['signIn'] is False
     assert result['subscriptionTrouble'] == 'Endpoint down' and result['accountTrouble'] == 'Endpoint down'
     assert result['alarming'] is False and result['blankSlate'] is False
-    expected_sampled = [
-        'Sampled tokens · 2 model(s) · cache excluded',
-        'Today 2.0K · last 7 days 2.0K tokens (1 of 7 days recorded)',
-        'Today by model: local/model <b>A</b> 2.0K · model-b 42',
-        'Evaluated input + generated output · cached input not counted']
-    assert result['localText'].split('\n') == (expected_sampled if LOCAL_CASE == 'sampled' else [record['usageStatusText'],
-        'No recorded days yet (not zero usage)', 'Evaluated input + generated output · cached input not counted']), result['localText']
+    expected_local = {'sampled': 'Today: local/model <b>A</b> 2.0K · model-b 42',
+                      'unrecorded': 'Activation pending', 'metrics-disabled': 'Metrics disabled',
+                      'no-model': 'No loaded model'}
+    assert result['localText'] == expected_local[LOCAL_CASE], result['localText']
     # Rendering: the Local section shows its own lines, and its caveat text is
     # never drawn as (urgent) trouble the way a subscription's would be.
     texts = result['texts']
-    assert texts.count('Grok') == 1 and texts.count(result['grokText']) == 1, texts
+    assert texts.count('Grok') == 1, texts
+    if result['grokText']: assert texts.count(result['grokText']) == 1, texts
     assert texts.count(result['localText']) == 1, texts
     assert 'Local' in texts and 'Llama.cpp router' in texts and 'Claude Code' in texts and texts.count('· max') == 3, texts
     assert 'Grok' in texts and 'X Premium' in texts, texts
@@ -458,9 +502,7 @@ ShellRoot {
     assert not any('CODEX SENTINEL' in t or 'CUSTOM GROK' in t for t in texts), texts
     assert local['authHelpText'] and local['authHelpText'] not in texts, texts
     assert not any('STRAY' in text or 'Stray' in text for text in texts), texts
-    assert result['emptyText'].split('\n') == [
-        'Activation pending · not collecting', 'No recorded days yet (not zero usage)',
-        'Evaluated input + generated output · cached input not counted'], result['emptyText']
+    assert result['emptyText'] == 'Activation pending', result['emptyText']
 
     # Pinned totals are independent of rotation and remain above the scrolled body.
     assert result['pinnedBefore'], 'Persistent token header missing (totals still rotate away)'
@@ -469,13 +511,27 @@ ShellRoot {
     expected_value = {'recorded':1000, 'zero':0, 'missing':None}[CLOUD_CASE]
     expected_count = {'recorded':'1.0K', 'zero':'0', 'missing':'—'}[CLOUD_CASE]
     expected_sources = '0/6 sources' if CLOUD_CASE == 'missing' else '1/4 sources'
-    for expected in ['Recorded cloud tokens · partial coverage', 'Today ' + expected_count,
-                     'Last 7 recorded days —', 'Recorded history ' + expected_count, expected_sources,
-                     'Unattributed Codex CLI', 'excluded', 'not subscription lifetime']:
+    for expected in ['Recorded tokens · partial', 'Cloud · today ' + expected_count,
+                     'recorded ' + expected_count, 'Local sampled', 'Codex CLI']:
         assert expected in fixed, (expected, fixed)
+    if 'content: PanelKeyCatcher {' in (STOCK/'Panel.qml').read_text():
+        assert result['preOpenHeaderAbsent'], "Native lazy content must not be built at startup"
+    assert result['headerRetainedOnReopen'], "Cached native content must survive closing and reopening"
     geometry = result['pinnedGeometry']
-    assert geometry['visible'] and geometry['width'] > 0 and geometry['height'] > 0
-    assert geometry['bodyY'] >= geometry['y'] + geometry['height'] and geometry['scrollY'] > 0, geometry
+    assert geometry['visible'] and geometry['width'] > 0 and 0 < geometry['height'] <= 140, geometry
+    for redundant in ['not all-account', 'not subscription lifetime', 'unattributed', 'In + Out +', 'cache excluded', 'quota-only']:
+        assert redundant not in fixed, (redundant, fixed)
+    assert geometry['bodyY'] >= geometry['y'] + geometry['height'], geometry
+    available = 450 if screen_case == 'short' else 1400
+    natural = geometry['bodyY'] + geometry['bodyContent'] + geometry['inset']
+    assert abs(geometry['popupHeight'] - min(available, natural)) <= 2, geometry
+    if natural <= available:
+        assert geometry['scrollY'] == 0 and geometry['bodyHeight'] + 1 >= geometry['bodyContent'], geometry
+        cards = result['providerGeometry']
+        assert {c['id'] for c in cards} == set(result['ids']), cards
+        assert all(c['y'] >= -1 and c['y'] + c['height'] <= geometry['bodyHeight'] + 1 for c in cards), cards
+    else:
+        assert geometry['scrollY'] > 0 and geometry['bodyContent'] > geometry['bodyHeight'], geometry
     bar = result['barTokens']
     assert bar['visible'] and bar['height'] > 0, bar
     if os.environ.get('ALACARCHY_BAR_CASE') == 'vertical':
@@ -491,11 +547,12 @@ ShellRoot {
         'Claude merged message counts must remain unavailable, not token totals'
     assert result['pinnedPlainText'], 'Counter labels must use plain-text sinks'
     assert totals['local']['today'] == (2042 if LOCAL_CASE == 'sampled' else None)
-    assert 'quota-only' in totals['byProvider']['codex-hermes-1']
-    assert 'quota-only' in totals['byProvider']['codex-hermes-2']
-    assert any('token counters unavailable (quota-only)' in text for text in texts)
-    for i in range(1, 4):
-        assert 'Native account ' + str(i) + ': token counters unavailable (quota-only)' in totals['byProvider']['claude']
+    assert totals['byProvider']['codex-hermes-1'] == totals['byProvider']['codex-hermes-2'] == ''
+    assert not any('token counters unavailable (quota-only)' in text for text in texts)
+    if CLOUD_CASE != 'missing':
+        assert expected_count + ' today' in totals['byProvider']['claude']
+    else:
+        assert totals['byProvider']['claude'] == ''
     print('PASS persistent bar/header, scroll/rotation independence, cloud/Local/Codex scopes and quota-only coverage')
 
     # The legacy summary's cloud accounting still excludes sampled Local tokens.

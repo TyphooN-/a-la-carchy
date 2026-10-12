@@ -105,25 +105,20 @@ RECORDED_TOKEN_FUNCTIONS = '''  // Preserve absent counters: native numberValue(
   }
 
   function recordedTokenProviderText(p, aggregate, accounts, usesAggregate) {
-    var lines = []
-    var windows = ["today", "week", "history"]
-    var labels = ["Today", "last 7 recorded days", "recorded history"]
-    var counts = []
-    for (var w = 0; w < windows.length; w++)
-      counts.push(labels[w] + " " + (aggregate[windows[w]] === null ? "—" : formatTokenCount(aggregate[windows[w]])))
-    if (usesAggregate) {
-      lines.push("Recorded provider tokens · " + counts.join(" · "))
-      if (p.readOnly !== true) lines.push("Native history unattributed to accounts · aggregate counted once")
+    function counts(stats) {
+      var values = []
+      if (stats.today !== null) values.push(formatTokenCount(stats.today) + " today")
+      if (stats.week !== null) values.push(formatTokenCount(stats.week) + " last 7 days")
+      if (stats.history !== null) values.push(formatTokenCount(stats.history) + " recorded")
+      return values.join(" · ")
     }
-    if (accounts.length > 4096) return lines.concat(["Account counter coverage unavailable · display bound exceeded"]).join("\\n")
-    var rows = accounts.length > 0 ? accounts : (usesAggregate ? [] : [p])
-    for (var a = 0; a < rows.length; a++) {
-      var row = rows[a] || {}
-      var stats = recordedTokenWindows(recordedTokenCounters(row.tokenCounters || row, p.providerId), false)
-      var known = stats.today !== null || stats.week !== null || stats.history !== null
-      var label = recordedTokenLabel(row.label || row.providerName || row.id || row.providerId)
-      if (!known) lines.push(label + ": token counters unavailable (" + ((row.limits && row.limits.length > 0) || row.hasLocalStats === false ? "quota-only" : "not zero usage") + ")")
-      else lines.push(label + ": " + (usesAggregate ? "account counters excluded · provider aggregate counted once" : "recorded account counters"))
+    if (usesAggregate) return counts(aggregate)
+    if (accounts.length > 4096) return ""
+    var lines = []
+    for (var a = 0; a < accounts.length; a++) {
+      var row = accounts[a] || {}
+      var text = counts(recordedTokenWindows(recordedTokenCounters(row.tokenCounters || row, p.providerId), false))
+      if (text !== "") lines.push(recordedTokenLabel(row.label || row.id) + ": " + text)
     }
     return lines.join("\\n")
   }
@@ -274,31 +269,18 @@ LIMITS_LOCAL_FUNCTION = '''  // a-la-carchy: what the Local section says. These 
     if (!p) return ""
     var lines = []
     var status = String(p.usageStatusText || "")
-    if (status !== "") lines.push(status)
-    var days = p.recentDays || []
-    var recorded = 0
-    var week = 0
-    for (var i = 0; i < days.length; i++) {
-      if (!days[i] || days[i].recorded !== true) continue
-      recorded++
-      week += Number(days[i].messageCount || 0)
-    }
-    var lastDay = days.length > 0 ? days[days.length - 1] : null
-    var today = lastDay && lastDay.recorded === true
-      ? usage.formatTokenCount(Number(p.todayTotalTokens || 0)) : "—"
-    if (recorded > 0)
-      lines.push("Today " + today + " · last 7 days "
-        + usage.formatTokenCount(week) + " tokens (" + recorded + " of " + days.length + " days recorded)")
-    else
-      lines.push("No recorded days yet (not zero usage)")
+    if (status.indexOf("Sampled tokens") !== 0 && status !== "")
+      lines.push(status.replace(/ · (history retained|not collecting)$/, ""))
     var models = p.todayTokensByModel || {}
     var names = Object.keys(models).filter(function(id) { return Number(models[id]) > 0 })
     names.sort(function(a, b) { return Number(models[b]) - Number(models[a]) || (a < b ? -1 : 1) })
-    if (names.length > 0) {
-      var shown = names.map(function(id) { return id + " " + usage.formatTokenCount(Number(models[id])) })
-      lines.push("Today by model: " + shown.join(" · "))
+    if (names.length > 0)
+      lines.push("Today: " + names.map(function(id) { return id + " " + usage.formatTokenCount(Number(models[id])) }).join(" · "))
+    if (lines.length === 0) {
+      var days = p.recentDays || []
+      var last = days.length > 0 ? days[days.length - 1] : null
+      lines.push(last && last.recorded === true && p.todayTotalTokens === 0 ? "No tokens today" : "No token data")
     }
-    lines.push("Evaluated input + generated output · cached input not counted")
     return lines.join("\\n")
   }
 
@@ -319,24 +301,28 @@ TOKEN_PANEL_FUNCTIONS = '''  readonly property var recordedTotals: usage.recorde
       + (window.overflow ? " · sum unavailable" : "")
   }
 
+  function recordedCloudTotalsText() {
+    var p = recordedTotals.cloud
+    return "Cloud · today " + recordedCount(p.today.value)
+      + (p.week.value === null ? "" : " · 7 days " + recordedCount(p.week.value))
+      + " · recorded " + recordedCount(p.history.value)
+  }
+
   function recordedLocalTotalsText() {
     var p = recordedTotals.local
-    return "Local sampled (separate) · today " + recordedCount(p.today)
-      + " · last 7 recorded days " + recordedCount(p.week) + " (" + p.recordedDays + " day" + (p.recordedDays === 1 ? "" : "s") + ")"
-      + " · recorded history " + recordedCount(p.history)
-      + "\\nEvaluated input + generated output · cached input not counted"
+    return "Local sampled · today " + recordedCount(p.today)
+      + (p.week === null || p.week === p.history ? "" : " · 7 days " + recordedCount(p.week))
+      + " · recorded " + recordedCount(p.history)
   }
 
   function recordedCodexTotalsText() {
     var p = recordedTotals.codex
-    return "Unattributed Codex CLI · today " + recordedCount(p.today)
-      + " · last 7 recorded days " + recordedCount(p.week) + " · recorded history " + recordedCount(p.history)
-      + " · excluded from cloud subtotal / Hermes credentials"
+    return "Codex CLI · today " + recordedCount(p.today) + " · recorded " + recordedCount(p.history)
   }
 
 '''
 
-TOKEN_HEADER = '''      // Pinned outside the Flickable: totals cannot rotate or scroll away.
+TOKEN_HEADER = '''      // Pinned totals; explanations are available on hover, not repeated in cards.
       Column {
         id: recordedTokenHeader
         objectName: "recordedTokenHeader"
@@ -344,63 +330,39 @@ TOKEN_HEADER = '''      // Pinned outside the Flickable: totals cannot rotate or
         anchors.left: parent.left
         anchors.right: parent.right
         spacing: Style.space(4)
-
         Text {
           width: parent.width
           textFormat: Text.PlainText
-          text: "Recorded cloud tokens · partial coverage"
+          text: "Recorded tokens · partial"
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
           font.bold: true
           wrapMode: Text.WordWrap
+          HoverHandler { id: tokenHelpHover }
+          ToolTip.visible: tokenHelpHover.hovered
+          ToolTip.delay: 300
+          ToolTip.text: "Recorded counters only. Cloud includes cache; Local is sampled and excludes cache. CLI history may share a Hermes account. — unavailable."
         }
         Repeater {
-          model: [{key: "today", label: "Today"}, {key: "week", label: "Last 7 recorded days"}, {key: "history", label: "Recorded history"}]
+          model: [root.recordedCloudTotalsText(), root.recordedLocalTotalsText(), root.recordedCodexTotalsText()]
           Text {
-            required property var modelData
+            required property string modelData
             width: recordedTokenHeader.width
             textFormat: Text.PlainText
-            text: root.recordedCloudWindowText(modelData.key, modelData.label)
-            color: root.foreground
+            text: modelData
+            color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
           }
-        }
-        Text {
-          width: parent.width
-          textFormat: Text.PlainText
-          text: "Recorded subtotal, not all-account usage; not subscription lifetime. In + Out + Cache read + Cache creation. — means unavailable."
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          wrapMode: Text.WordWrap
-        }
-        Text {
-          width: parent.width
-          textFormat: Text.PlainText
-          text: root.recordedLocalTotalsText()
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          wrapMode: Text.WordWrap
-        }
-        Text {
-          width: parent.width
-          textFormat: Text.PlainText
-          text: root.recordedCodexTotalsText()
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          wrapMode: Text.WordWrap
         }
       }
 
 '''
 
 TOKEN_PROVIDER_TEXT = '''    Text {
-      visible: !!section.provider && section.provider.providerId !== "local"
+      visible: text !== "" && !!section.provider && section.provider.providerId !== "local"
       width: parent.width
       textFormat: Text.PlainText
       text: section.provider ? String(root.recordedTotals.byProvider[section.provider.providerId] || "") : ""
@@ -422,8 +384,25 @@ def transform_token_visibility(text):
                         '    fixedWidth: vertical ? -1 : canvasSize + tokenLabelMetrics.width + Style.space(4) + scaledHorizontalMargin * 2\n'
                         '    TextMetrics {\n      id: tokenLabelMetrics\n      text: button.labelText\n'
                         '      font.family: button.fontFamily\n      font.pixelSize: button.fontSize\n    }')
-    text = replace_once(text, '    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(860))',
-                        '    contentHeight: panel.fittedContentHeight(recordedTokenHeader.implicitHeight + Style.space(16) + column.implicitHeight, Style.space(860))')
+    eager_height = '    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(860))'
+    lazy_height = '    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(860))'
+    shapes = [anchor for anchor in (eager_height, lazy_height) if anchor in text]
+    if len(shapes) != 1 or text.count(shapes[0]) != 1:
+        raise ValueError(UNSUPPORTED)
+    lazy_content = '    content: PanelKeyCatcher {'
+    if shapes[0] == lazy_height:
+        if text.count(lazy_content) != 1:
+            raise ValueError(UNSUPPORTED)
+        text = replace_once(text, lazy_height,
+                            '    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight)')
+        text = replace_once(text, '      property alias providerSections: providerSections\n      implicitHeight: column.implicitHeight',
+                            '      property alias providerSections: providerSections\n'
+                            '      implicitHeight: recordedTokenHeader.implicitHeight + Style.space(16) + column.implicitHeight')
+    else:
+        if lazy_content in text:
+            raise ValueError(UNSUPPORTED)
+        text = replace_once(text, eager_height,
+                            '    contentHeight: panel.fittedContentHeight(recordedTokenHeader.implicitHeight + Style.space(16) + column.implicitHeight)')
     text = replace_once(text, '      Flickable {\n        id: panelFlick',
                         TOKEN_HEADER + '      Flickable {\n        id: panelFlick\n        objectName: "recordedTokenBody"')
     text = replace_once(text, '        anchors.fill: parent\n        anchors.leftMargin: -overhang',
@@ -498,8 +477,8 @@ GROK_QUOTA_FUNCTIONS = '''  // A reset forecast is not an authenticated quota me
     if (!p || p.providerId !== "grok" || root.grokQuotaFresh(p)) return ""
     var fetched = Number(p.limitsFetchedAt)
     if (isFinite(fetched) && fetched > 0 && fetched <= root.nowMs + 60000)
-      return "Subscription quota stale · last successful reading " + new Date(fetched).toLocaleString()
-    return "Subscription quota unavailable · refresh Grok sign-in"
+      return "Quota stale"
+    return "Quota unavailable · sign in"
   }
 
   function grokAccountWindows(provider, account) {
@@ -520,10 +499,9 @@ GROK_QUOTA_FUNCTIONS = '''  // A reset forecast is not an authenticated quota me
     var models = p.modelUsage
     var ids = models && typeof models === "object" && !Array.isArray(models) ? Object.keys(models).sort() : []
     if (ids.length === 0) {
-      lines.push(p.hasLocalStats === true ? "Native CLI history recorded · model counters unavailable" : "Native CLI token history unavailable (not zero usage)")
       return lines.join("\\n")
     }
-    lines.push("Native CLI recorded token history · not quota")
+    lines.push("Recorded tokens")
     var fields = ["inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"]
     var labels = ["In", "Out", "Cache read", "Cache creation"]
     // Bound rendering only; the complete producer ledger stays unchanged.

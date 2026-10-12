@@ -85,7 +85,36 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(rendered['layout'], 'limits')
         self.assertTrue('function localRouterText(p)' in rendered['Panel.qml'], 'Local formatting function missing')
         self.assertTrue('text: visible ? root.localRouterText(section.provider) : ""' in rendered['Panel.qml'], 'Local text surface missing')
-        self.assertTrue('No recorded days yet (not zero usage)' in rendered['Panel.qml'], 'Unknown coverage status missing')
+        self.assertIn('No token data', rendered['Panel.qml'])
+        self.assertIn('Quota stale', rendered['Panel.qml'])
+        self.assertIn('Quota unavailable · sign in', rendered['Panel.qml'])
+
+    def test_supported_eager_and_lazy_height_shapes(self):
+        from agents_fixture import PANEL_LIMITS
+        layout, eager = stager.patch_panel(PANEL_LIMITS)
+        self.assertEqual(layout, 'limits')
+        self.assertIn('panel.fittedContentHeight(recordedTokenHeader.implicitHeight + Style.space(16) + column.implicitHeight)', eager)
+        native = stager.source_bytes(SOURCE/'Panel.qml').decode()
+        self.assertIn('content: PanelKeyCatcher {', native)
+        layout, lazy = stager.patch_panel(native)
+        self.assertEqual(layout, 'limits')
+        self.assertIn('contentHeight: panel.fittedContentHeight(panel.loadedContentHeight)', lazy)
+        self.assertIn('implicitHeight: recordedTokenHeader.implicitHeight + Style.space(16) + column.implicitHeight', lazy)
+        self.assertEqual(lazy.count('id: recordedTokenHeader'), 1)
+        self.assertNotIn('Style.space(860)', lazy)
+
+    def test_lazy_shape_partial_or_mixed_anchors_are_refused(self):
+        native = stager.source_bytes(SOURCE/'Panel.qml').decode()
+        lazy_height = 'contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(860))'
+        eager_height = 'contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(860))'
+        malformed = [native.replace(lazy_height, eager_height),
+                     native.replace(lazy_height, lazy_height + '\n    ' + lazy_height),
+                     native.replace('implicitHeight: column.implicitHeight', 'implicitHeight: 0'),
+                     native.replace('content: PanelKeyCatcher {', 'PanelKeyCatcher {')]
+        for text in malformed:
+            with self.subTest(shape=text[:50]):
+                with self.assertRaises(ValueError):
+                    stager.patch_panel(text)
 
     def test_partial_limits_panel_is_refused(self):
         malformed = 'import QtQuick\nItem { function otherTrouble(item) { return "" } }\n'
