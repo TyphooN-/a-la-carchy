@@ -13,7 +13,7 @@ Local appears as a provider section alongside Claude Code, the read-only
 status, today's measured tokens, the measured seven-day total with recording
 coverage, and every observed model's daily total. It uses the widget's native
 light/dark provider-icon convention. Local's sampled counters are kept out of
-the rotating cross-subscription summary and never appear as a subscription quota
+the cross-subscription subtotal and never appear as a subscription quota
 meter or an authentication error. An unrecorded today displays **—**, not zero.
 
 This Omarchy dev release ships its own Grok collector, including subscription
@@ -24,6 +24,75 @@ count the first-party record. No Grok status-line configuration is needed here.
 The older tab-based Agents panel is still supported. It retains Local's
 seven-day chart and full per-model input/output rows. Layout detection is
 fail-closed: unsupported or ambiguous QML is not patched.
+
+## Persistent recorded totals (limits-first panel)
+
+The horizontal bar continuously shows **Cloud today … · partial/recorded**.
+Vertical bars show a compact count; **\*** marks partial coverage, explained in
+the tooltip. The popup pins
+**Today**, **Last 7 recorded days**, and **Recorded history** above its scrollable
+body; only the secondary model/prompt/session summary rotates. These are scoped
+recorded subtotals, **not complete all-account use or subscription lifetime**.
+The actual quota windows remain first inside each native provider/account card.
+
+- Raw counter presence is preserved before native normalization can turn a
+  missing field into zero. Quota-only Hermes/Grok rows say **token counters
+  unavailable (quota-only)**. Missing counters show **—**; a valid recorded zero
+  shows **0**. Coverage is shown separately for each window as known/selected
+  ledger sources. Provider-level history does not establish account attribution.
+- Each displayed provider aggregate is selected once, never added to its own
+  accounts. Only when no provider window has counters are its account counters
+  used instead. All displayed account rows receive coverage labels dynamically;
+  no account count is baked into the totals algorithm. Unknown account counters
+  are not imputed from the provider aggregate or subscription quota.
+- History sums the native **input**, **output**, **cache read**, and **cache
+  creation** buckets once. Missing optional cache buckets in older/Local records
+  mean no recorded cache bucket; invalid present values are unavailable. No
+  prompt/session count, quota percent, or provider/account roll-up is added to
+  these token fields.
+- The recent window selects at most seven explicitly recorded dates supplied
+  by `recentDays`, chronologically. The legacy `messageCount` field normally
+  holds tokens in native transcript scans. Claude's `dailyActivity` fallback
+  carries message/session/tool counts instead, and native merging can erase
+  those unit markers. Claude's recent-day sum therefore stays **unavailable**
+  until explicit token-unit provenance is supplied; its measured today/history
+  counters remain visible. Other identifiable fallback rows are rejected, not
+  relabelled as tokens. Recordings beyond the published recent
+  window are not rescanned to fill gaps. Local only publishes seven calendar
+  dates, so its available recorded-day count may be less than seven.
+- Local evaluated/generated **sampled** counters are pinned separately and
+  never enter the cloud subtotal: the same Hermes request can already be counted
+  by the router. Cache input remains excluded. History is bounded by retained
+  recording data (Local currently retains up to 365 days), not lifetime traffic.
+- Native Codex's existing record is read by a separate history-only reader and
+  pinned as **Unattributed Codex CLI … · excluded**. It is neither a duplicate
+  native provider nor a Hermes credential's usage. The current Hermes publisher
+  supplies quotas, not token history, so no exact all-account total is possible.
+- Aggregation is reactive to provider/FileView/sync revisions, never an animation
+  or per-frame scan. Oversized arrays/maps and unsafe numeric sums are unavailable
+  rather than silently truncated. All new text sinks are plain text.
+
+This change preserves the existing credential publisher, admission guards,
+read-only account actions and provider order. **The assigned base still admits
+only its two published Hermes Codex slots**; this totals change does not claim
+complete active-profile credential discovery, and does not widen admission to
+unregistered filenames. The totals loop itself handles arbitrarily many displayed
+rows within explicit defensive work bounds. Claude fallback data merged with
+other histories can lose its daily-activity marker upstream; that producer
+ambiguity remains, so these values must remain labelled recorded/partial rather
+than exact all-traffic counters. Source/candidate proof is offline only; live
+placement and bar-space acceptance require a separate guarded application.
+
+Focused offline checks (isolated HOME/XDG/TMPDIR, no live collectors):
+
+```sh
+ALACARCHY_AGENTS_SOURCE=/home/typhoon/omarchy/shell/plugins/agents python3 -B tests/agents-visible-totals.py
+ALACARCHY_AGENTS_SOURCE=/home/typhoon/omarchy/shell/plugins/agents ALACARCHY_SHELL_SOURCE=/home/typhoon/omarchy/shell python3 -B tests/agents-qml.py
+```
+
+The QML harness also accepts `ALACARCHY_CLOUD_CASE=zero|missing` and the existing
+Local cases. It loads real offscreen Qt with command stubs and ends with
+`Qt.quit()`; its child must exit zero, not merely print an assertion marker.
 
 ## Measurement contract
 

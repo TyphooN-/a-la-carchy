@@ -164,6 +164,28 @@ Panel {
     return [String(week)]
   }
 
+  function showPhrase() {
+    var n = summaryPhrases.length
+    shownPhrase = n > 0 ? summaryPhrases[phraseIndex % n] : ""
+  }
+
+  BarIconButton {
+    id: button
+    anchors.fill: parent
+    bar: root.bar
+    text: "󱚣"
+  }
+  KeyboardPanel {
+    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(860))
+    PanelKeyCatcher {
+      Flickable {
+        id: panelFlick
+        anchors.fill: parent
+        anchors.leftMargin: -overhang
+      }
+    }
+  }
+
   component ProviderSection: Column {
     id: section
     property var provider: null

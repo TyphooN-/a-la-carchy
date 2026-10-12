@@ -54,6 +54,8 @@ bridge = load('qml_bridge', ROOT/'extras/hermes-codex-usage/collector.py')
 bridge_fixture = load('qml_bridge_fixture', ROOT/'tests/hermes-codex-usage.py')
 LOCAL_CASE = os.environ.get('ALACARCHY_LOCAL_CASE', 'sampled')
 assert LOCAL_CASE in ('sampled', 'unrecorded', 'metrics-disabled', 'no-model')
+CLOUD_CASE = os.environ.get('ALACARCHY_CLOUD_CASE', 'recorded')
+assert CLOUD_CASE in ('recorded', 'zero', 'missing')
 
 # Keep native Quickshell IPC socket paths below Linux's sun_path limit.
 with tempfile.TemporaryDirectory(prefix='ag-') as td:
@@ -114,19 +116,31 @@ Item {
     subscription = {
         'id': 'claude', 'name': 'Claude Code', 'ready': True, 'tierLabel': 'max', 'usageStatusText': '', 'authHelpText': '',
         'limits': [{'label': 'Session (5-hour)', 'percent': 0.25, 'resetsAt': ''}],
-        'todayPrompts': 3, 'todaySessions': 1, 'todayTotalTokens': 1000, 'todayTokensByModel': {'claude-opus-4-8': 1000},
+        'hasLocalStats': True, 'todayPrompts': 3, 'todaySessions': 1, 'todayTotalTokens': 1000, 'todayTokensByModel': {'claude-opus-4-8': 1000},
         'recentDays': [{'date': day, 'messageCount': 1000 if day == days[-1] else 0} for day in days],
         'totalPrompts': 3, 'totalSessions': 1, 'activeDays': 1,
         'modelUsage': {'claude-opus-4-8': {'inputTokens': 600, 'outputTokens': 400, 'cacheReadInputTokens': 0, 'cacheCreationInputTokens': 0}}}
+    subscription['accounts'] = [{'id':'native-' + str(i), 'label':'Native account ' + str(i), 'plan':'max',
+                                 'active':i == 1, 'limits':subscription['limits'], 'usageStatusText':''} for i in range(1, 4)]
+    if CLOUD_CASE == 'zero':
+        subscription.update(todayTotalTokens=0, todayTokensByModel={},
+                            recentDays=[{'date':day, 'messageCount':0} for day in days],
+                            modelUsage={'claude-opus-4-8':{'inputTokens':0, 'outputTokens':0}})
+    elif CLOUD_CASE == 'missing':
+        for key in ('hasLocalStats', 'todayTotalTokens', 'todayTokensByModel', 'recentDays', 'modelUsage'):
+            subscription.pop(key)
     (usage/'claude.json').write_text(json.dumps(subscription))
     # Dev-channel Grok is first-party: retain its real record contract beside Local.
     native_grok = dict(subscription, id='grok', name='Grok', tierLabel='X Premium',
                        limits=[{'label': 'Weekly', 'percent': 0.75, 'resetsAt': (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=7)).isoformat()}],
                        limitsFetchedAt=dt.datetime.now(dt.timezone.utc).timestamp()*1000, limitsStale=False, hasLocalStats=False,
                        todayPrompts=0, todaySessions=0, todayTotalTokens=0, todayTokensByModel={},
-                       recentDays=[], modelUsage={})
+                       recentDays=[], modelUsage={}, accounts=[])
     (usage/'grok.json').write_text(json.dumps(native_grok))
-    native_codex = dict(subscription, id='codex', name='NATIVE CODEX SENTINEL', tierLabel='team')
+    native_codex = dict(subscription, id='codex', name='NATIVE CODEX SENTINEL', tierLabel='team',
+                        hasLocalStats=True, todayTotalTokens=0,
+                        recentDays=[{'date':day, 'messageCount':0} for day in days],
+                        modelUsage={'native-codex-history':{'inputTokens':600,'outputTokens':400}})
     (usage/'codex.json').write_text(json.dumps(native_codex))
     (usage/'codex-hermes-3.json').write_text(json.dumps(dict(subscription, id='codex-hermes-3', name='GHOST CODEX SENTINEL')))
     rows = [bridge_fixture.entry(subject='auth0|qml-member-1'), bridge_fixture.entry(subject='auth0|qml-member-2')]
@@ -184,6 +198,9 @@ Item {
            'QT_QPA_PLATFORMTHEME': '', 'QT_STYLE_OVERRIDE': 'Fusion', 'QT_QUICK_CONTROLS_STYLE': 'Basic',
            'DBUS_SESSION_BUS_ADDRESS': 'unix:path=' + str(fixture/'no-session-bus'),
            'http_proxy': 'http://127.0.0.1:9', 'https_proxy': 'http://127.0.0.1:9'}
+    bar_case = os.environ.get('ALACARCHY_BAR_CASE', 'horizontal')
+    assert bar_case in ('horizontal', 'vertical')
+    env['ALACARCHY_BAR_CASE'] = bar_case
     for name in EXPECTED_STUBS + FORBIDDEN_STUBS:
         assert shutil.which(name, path=env['PATH']) == str(bin_dir/name), 'a real ' + name + ' is reachable'
 
@@ -196,7 +213,7 @@ ShellRoot {
   Agents.Main { id: admission; settings: ({ refreshIntervalSec: 3600 }) }
   QtObject {
     id: fixtureBar
-    property bool vertical: false
+    property bool vertical: Quickshell.env("ALACARCHY_BAR_CASE") === "vertical"
     property bool foregroundAnimationEnabled: false
     property int barSize: 32
     property string position: "top"
@@ -224,6 +241,22 @@ ShellRoot {
     var kids = item.children || []
     for (var i = 0; i < kids.length; i++) shownTexts(kids[i], out)
     return out
+  }
+  function plainTexts(item) {
+    if (item.textFormat !== undefined && item.textFormat !== Text.PlainText) return false
+    var kids = item.children || []
+    for (var i = 0; i < kids.length; i++) if (!plainTexts(kids[i])) return false
+    return true
+  }
+  function namedItem(item, name) {
+    if (!item) return null
+    if (item.objectName === name) return item
+    var kids = item.children || []
+    for (var i = 0; i < kids.length; i++) {
+      var found = namedItem(kids[i], name)
+      if (found) return found
+    }
+    return null
   }
   // Inspect the instantiated provider delegate, not a plain JS provider copy:
   // Repeater modelData converts nested limits to a Qt sequence.
@@ -256,6 +289,13 @@ ShellRoot {
       var texts = shownTexts(panel, [])
       if (!local || texts.indexOf("Local") < 0) return // sections are still being built
       root.reported = true
+      var header = namedItem(panel, "recordedTokenHeader")
+      var tokenBar = namedItem(panel, "recordedTokenBar")
+      var body = namedItem(panel, "recordedTokenBody")
+      var pinnedBefore = header ? shownTexts(header, []) : []
+      panel.shownPhrase = "Mostly rotating sentinel"
+      panel.phraseIndex++
+      if (body) body.contentY = Math.max(0, body.contentHeight - body.height)
       var h1 = list.filter(function(p) { return p.providerId === "codex-hermes-1" })[0]
       var h2 = list.filter(function(p) { return p.providerId === "codex-hermes-2" })[0]
       var syntheticAccount = {id:"synthetic", active:false, usageStatusText:"Waiting for auth"}
@@ -283,6 +323,15 @@ ShellRoot {
       admission.syncRevision++
       console.log("AGENTS_QML_RESULT " + JSON.stringify({
         hermes: [h1, h2],
+        recordedTotals: panel.recordedTotals,
+        pinnedBefore: pinnedBefore,
+        pinnedAfter: header ? shownTexts(header, []) : [],
+        pinnedPlainText: header ? plainTexts(header) : false,
+        pinnedGeometry: header ? {visible:header.visible, y:header.y, width:header.width, height:header.height,
+                                  bodyY:body ? body.y : -1, scrollY:body ? body.contentY : -1} : null,
+        barTokens: tokenBar ? {text:tokenBar.labelText, glyph:tokenBar.text, vertical:tokenBar.vertical,
+                              paintedWidth:tokenBar.glyphPaintedWidth, texts:shownTexts(tokenBar, []),
+                              visible:tokenBar.visible, width:tokenBar.width, height:tokenBar.height} : null,
         signInHermes: panel.needsSignIn({providerId:"codex-hermes-2", readOnly:true, usageStatusText:"Waiting for auth"}),
         accountsHermes: panel.providerAccounts(guarded),
         switchHermes: h2.accountSwitch,
@@ -403,7 +452,7 @@ ShellRoot {
     texts = result['texts']
     assert texts.count('Grok') == 1 and texts.count(result['grokText']) == 1, texts
     assert texts.count(result['localText']) == 1, texts
-    assert 'Local' in texts and 'Llama.cpp router' in texts and 'Claude Code' in texts and 'Max' in texts, texts
+    assert 'Local' in texts and 'Llama.cpp router' in texts and 'Claude Code' in texts and texts.count('· max') == 3, texts
     assert 'Grok' in texts and 'X Premium' in texts, texts
     assert 'Codex (Hermes 1)' in texts and 'Codex (Hermes 2)' in texts and bridge.REASONS['expired'] in texts, texts
     assert not any('CODEX SENTINEL' in t or 'CUSTOM GROK' in t for t in texts), texts
@@ -413,8 +462,45 @@ ShellRoot {
         'Activation pending · not collecting', 'No recorded days yet (not zero usage)',
         'Evaluated input + generated output · cached input not counted'], result['emptyText']
 
-    # The hero's cross-subscription summary counts the subscription only.
-    assert '1.0K tokens today' in result['phrases'] and '1.0K tokens this week' in result['phrases'], result['phrases']
+    # Pinned totals are independent of rotation and remain above the scrolled body.
+    assert result['pinnedBefore'], 'Persistent token header missing (totals still rotate away)'
+    assert result['pinnedAfter'] == result['pinnedBefore'], 'Rotation or scrolling hid the fixed header'
+    fixed = '\n'.join(result['pinnedAfter'])
+    expected_value = {'recorded':1000, 'zero':0, 'missing':None}[CLOUD_CASE]
+    expected_count = {'recorded':'1.0K', 'zero':'0', 'missing':'—'}[CLOUD_CASE]
+    expected_sources = '0/6 sources' if CLOUD_CASE == 'missing' else '1/4 sources'
+    for expected in ['Recorded cloud tokens · partial coverage', 'Today ' + expected_count,
+                     'Last 7 recorded days —', 'Recorded history ' + expected_count, expected_sources,
+                     'Unattributed Codex CLI', 'excluded', 'not subscription lifetime']:
+        assert expected in fixed, (expected, fixed)
+    geometry = result['pinnedGeometry']
+    assert geometry['visible'] and geometry['width'] > 0 and geometry['height'] > 0
+    assert geometry['bodyY'] >= geometry['y'] + geometry['height'] and geometry['scrollY'] > 0, geometry
+    bar = result['barTokens']
+    assert bar['visible'] and bar['height'] > 0, bar
+    if os.environ.get('ALACARCHY_BAR_CASE') == 'vertical':
+        assert bar['vertical'] and bar['width'] <= 32 and bar['text'] == '', bar
+        assert bar['glyph'] == expected_count + '*' and bar['glyph'] in bar['texts'], bar
+        assert 0 < bar['paintedWidth'] <= bar['width'], bar
+    else:
+        assert bar['text'] == 'Cloud today ' + expected_count + ' · partial' and bar['width'] > 100, bar
+    totals = result['recordedTotals']
+    assert totals['cloud']['today']['value'] == expected_value and totals['cloud']['today']['known'] == (0 if CLOUD_CASE == 'missing' else 1)
+    assert totals['cloud']['history']['value'] == expected_value and totals['codex']['history'] == 1000
+    assert totals['cloud']['week']['value'] is None and totals['cloud']['week']['known'] == 0, \
+        'Claude merged message counts must remain unavailable, not token totals'
+    assert result['pinnedPlainText'], 'Counter labels must use plain-text sinks'
+    assert totals['local']['today'] == (2042 if LOCAL_CASE == 'sampled' else None)
+    assert 'quota-only' in totals['byProvider']['codex-hermes-1']
+    assert 'quota-only' in totals['byProvider']['codex-hermes-2']
+    assert any('token counters unavailable (quota-only)' in text for text in texts)
+    for i in range(1, 4):
+        assert 'Native account ' + str(i) + ': token counters unavailable (quota-only)' in totals['byProvider']['claude']
+    print('PASS persistent bar/header, scroll/rotation independence, cloud/Local/Codex scopes and quota-only coverage')
+
+    # The legacy summary's cloud accounting still excludes sampled Local tokens.
+    if CLOUD_CASE == 'recorded':
+        assert '1.0K tokens today' in result['phrases'] and '1.0K tokens this week' in result['phrases'], result['phrases']
     assert not any('3.0K' in phrase or '2.0K' in phrase or 'model' in phrase.lower() for phrase in result['phrases']), result['phrases']
 
     # Commands: the panel's refresh reached the stub; nothing else ran.

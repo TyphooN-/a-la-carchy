@@ -31,6 +31,152 @@ def replace_once(text, old, new):
         raise ValueError(UNSUPPORTED)
     return text.replace(old, new, 1)
 
+RECORDED_TOKEN_FUNCTIONS = '''  // Preserve absent counters: native numberValue() otherwise turns them into zero.
+  function recordedTokenCounters(raw, providerId) {
+    raw = raw || {}
+    return { providerId: String(providerId || raw.providerId || raw.id || ""),
+             hasLocalStats: raw.hasLocalStats, todayTotalTokens: raw.todayTotalTokens,
+             recentDays: raw.recentDays, modelUsage: raw.modelUsage }
+  }
+
+  function validRecordedTokens(n) {
+    return typeof n === "number" && isFinite(n) && n >= 0
+      && Math.floor(n) === n && n <= 9007199254740991
+  }
+
+  function recordedTokenWindows(raw, local) {
+    var out = {today: null, week: null, history: null, recordedDays: 0}
+    if (!raw || raw.hasLocalStats === false) return out
+    if (validRecordedTokens(raw.todayTotalTokens)) out.today = raw.todayTotalTokens
+    var days = raw.recentDays
+    // The native Claude merger drops dailyActivity's message-count markers.
+    // Without explicit units, that provider's days cannot establish tokens.
+    var dailyTokens = local || String(raw.providerId || raw.id || "") !== "claude"
+    if (dailyTokens && days && typeof days.length === "number" && days.length > 0 && days.length <= 366) {
+      var recorded = []
+      var seen = Object.create(null)
+      var valid = true
+      for (var i = 0; i < days.length; i++) {
+        var day = days[i] || {}
+        var date = String(day.date || "")
+        // Claude's legacy stats-cache dailyActivity holds messages, not tokens.
+        if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(date) || seen[date]
+            || day.sessionCount !== undefined || day.toolCallCount !== undefined) { valid = false; break }
+        seen[date] = true
+        if (day.recorded === false) continue
+        if (!validRecordedTokens(day.messageCount)) { valid = false; break }
+        recorded.push({date: date, tokens: day.messageCount})
+      }
+      if (local && days[days.length - 1] && days[days.length - 1].recorded !== true) out.today = null
+      if (valid && recorded.length > 0) {
+        recorded.sort(function(a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : 0 })
+        var sum = 0
+        var first = Math.max(0, recorded.length - 7)
+        for (var d = first; d < recorded.length; d++) sum += recorded[d].tokens
+        if (validRecordedTokens(sum)) { out.week = sum; out.recordedDays = recorded.length - first }
+      }
+    } else if (local) out.today = null
+    var models = raw.modelUsage
+    if (models && typeof models === "object" && !Array.isArray(models)) {
+      var ids = Object.keys(models)
+      var fields = ["inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"]
+      var total = 0
+      var ok = ids.length <= 4096 && (ids.length > 0 || raw.hasLocalStats === true)
+      for (var m = 0; ok && m < ids.length; m++) {
+        var bucket = models[ids[m]]
+        ok = !!bucket && typeof bucket === "object" && !Array.isArray(bucket)
+        var present = false
+        for (var f = 0; ok && f < fields.length; f++) {
+          var n = bucket[fields[f]]
+          if (n === undefined) continue // Older/Local records omit cache counters.
+          present = true
+          ok = validRecordedTokens(n)
+          if (ok) total += n
+        }
+        ok = ok && present && validRecordedTokens(total)
+      }
+      if (ok) out.history = total
+    }
+    return out
+  }
+
+  function recordedTokenLabel(value) {
+    return String(value || "Account").slice(0, 512)
+  }
+
+  function recordedTokenProviderText(p, aggregate, accounts, usesAggregate) {
+    var lines = []
+    var windows = ["today", "week", "history"]
+    var labels = ["Today", "last 7 recorded days", "recorded history"]
+    var counts = []
+    for (var w = 0; w < windows.length; w++)
+      counts.push(labels[w] + " " + (aggregate[windows[w]] === null ? "—" : formatTokenCount(aggregate[windows[w]])))
+    if (usesAggregate) {
+      lines.push("Recorded provider tokens · " + counts.join(" · "))
+      if (p.readOnly !== true) lines.push("Native history unattributed to accounts · aggregate counted once")
+    }
+    if (accounts.length > 4096) return lines.concat(["Account counter coverage unavailable · display bound exceeded"]).join("\\n")
+    var rows = accounts.length > 0 ? accounts : (usesAggregate ? [] : [p])
+    for (var a = 0; a < rows.length; a++) {
+      var row = rows[a] || {}
+      var stats = recordedTokenWindows(recordedTokenCounters(row.tokenCounters || row, p.providerId), false)
+      var known = stats.today !== null || stats.week !== null || stats.history !== null
+      var label = recordedTokenLabel(row.label || row.providerName || row.id || row.providerId)
+      if (!known) lines.push(label + ": token counters unavailable (" + ((row.limits && row.limits.length > 0) || row.hasLocalStats === false ? "quota-only" : "not zero usage") + ")")
+      else lines.push(label + ": " + (usesAggregate ? "account counters excluded · provider aggregate counted once" : "recorded account counters"))
+    }
+    return lines.join("\\n")
+  }
+
+  function recordedTokenTotalsFor(list, nativeCodex) {
+    var cloud = {today: {value: 0, known: 0, sources: 0, overflow: false},
+                 week: {value: 0, known: 0, sources: 0, overflow: false},
+                 history: {value: 0, known: 0, sources: 0, overflow: false}}
+    var out = {cloud: cloud, local: recordedTokenWindows(null, true),
+               codex: recordedTokenWindows(nativeCodex, false), byProvider: Object.create(null)}
+    var seen = Object.create(null)
+    var windows = ["today", "week", "history"]
+    function add(stats) {
+      for (var w = 0; w < windows.length; w++) {
+        var key = windows[w]
+        var acc = cloud[key]
+        acc.sources++
+        if (stats[key] === null) continue
+        acc.known++
+        acc.value += stats[key]
+        if (!validRecordedTokens(acc.value)) acc.overflow = true
+      }
+    }
+    if (!list || list.length > 4096) list = [] // Explicit unknown, never truncated totals.
+    for (var i = 0; i < list.length; i++) {
+      var p = list[i] || {}
+      var id = String(p.providerId || "")
+      if (seen[id]) continue
+      seen[id] = true
+      var stats = recordedTokenWindows(p.tokenCounters || p, id === "local")
+      if (id === "local") { out.local = stats; continue } // Overlaps Hermes requests.
+      if (id === "codex") continue // Never attribute native CLI history to a Hermes credential.
+      var accounts = p.accounts || []
+      var aggregate = stats.today !== null || stats.week !== null || stats.history !== null
+      // Choose a single ledger level for the entire provider, not per-window
+      // fallbacks that could count overlapping aggregate/account histories.
+      if (aggregate || accounts.length === 0 || accounts.length > 4096) add(stats)
+      else for (var a = 0; a < accounts.length; a++) add(recordedTokenWindows(recordedTokenCounters(accounts[a].tokenCounters || accounts[a], id), false))
+      out.byProvider[id] = recordedTokenProviderText(p, stats, accounts, aggregate)
+    }
+    for (var w = 0; w < windows.length; w++) {
+      var acc = cloud[windows[w]]
+      if (acc.known === 0 || acc.overflow) acc.value = null
+    }
+    return out
+  }
+
+  // One reactive pass per data/provider/sync revision, including Local's own
+  // FileView. No animation, frame or reset-clock rescans of model history.
+  readonly property var recordedTokenTotals: recordedTokenTotalsFor(enabledProviders, nativeCodexHistory.record)
+
+'''
+
 def transform_main(text):
     # The Local record lives outside the usage directory the stock widget
     # scans, and it is kept out of `agents`: localSnapshot() cannot include it
@@ -42,6 +188,8 @@ def transform_main(text):
                         '  // a-la-carchy: the llama.cpp router record of this machine only.\n'
                         '  readonly property string localRouterRecordPath: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/omarchy/local-router/agents/local.json"\n\n'
                         '  Agent {\n    id: localRouterAgent\n    agentId: "local"\n    path: root.localRouterRecordPath\n  }\n\n'
+                        '  // Read native Codex history separately; never admit a duplicate provider.\n'
+                        '  Agent {\n    id: nativeCodexHistory\n    agentId: "codex"\n    path: root.usageDir + "/codex.json"\n  }\n\n'
                         '  Instantiator {\n    id: agentInstantiator')
     text = replace_once(text, '    var syncedProviders = syncConfigured() && aggregateData && aggregateData.providers ? aggregateData.providers : {}',
                         '    var localRouterRecord = localRouterAgent.record\n'
@@ -64,12 +212,15 @@ def transform_main(text):
                         '      providerId: String(record.id),\n      readOnly: external,\n'
                         '      providerName: String(record.id) === "codex-hermes-1" ? "Codex (Hermes 1)" : String(record.id) === "codex-hermes-2" ? "Codex (Hermes 2)" : String(record.name || record.id),\n'
                         '      ready: record.ready === true || synced,')
+    text = replace_once(text, '      ready: record.ready === true || synced,',
+                        '      ready: record.ready === true || synced,\n'
+                        '      tokenCounters: recordedTokenCounters(synced ? stats : record, String(record.id)),')
     text = replace_once(text, '      accounts: Array.isArray(record.accounts) ? record.accounts : [],',
                         '      accounts: external ? [] : (Array.isArray(record.accounts) ? record.accounts : []),')
     text = replace_once(text, '      accountSwitch: record.accountSwitch || ({ mode: "manual", threshold: 95 }),',
                         '      accountSwitch: external ? null : (record.accountSwitch || ({ mode: "manual", threshold: 95 })),')
     return replace_once(text, '  function syncedStatsFor(providerId) {',
-                        '  function syncedStatsFor(providerId) {\n    if (providerId === "local") return null')
+                        RECORDED_TOKEN_FUNCTIONS + '  function syncedStatsFor(providerId) {\n    if (providerId === "local") return null')
 
 def transform_panel_tabs(text):
     """Omarchy 4.0.4 panel: one tab per agent with model rows and a 7-day chart."""
@@ -153,6 +304,138 @@ LIMITS_LOCAL_FUNCTION = '''  // a-la-carchy: what the Local section says. These 
 
 '''
 
+TOKEN_PANEL_FUNCTIONS = '''  readonly property var recordedTotals: usage.recordedTokenTotals
+  readonly property string recordedTokenBarText: "Cloud today " + recordedCount(recordedTotals.cloud.today.value)
+    + (recordedTotals.cloud.today.known < recordedTotals.cloud.today.sources || recordedTotals.cloud.today.value === null ? " · partial" : " · recorded")
+
+  readonly property string recordedTokenCompactText: recordedCount(recordedTotals.cloud.today.value)
+    + (recordedTotals.cloud.today.known < recordedTotals.cloud.today.sources || recordedTotals.cloud.today.value === null ? "*" : "")
+
+  function recordedCount(n) { return n === null ? "—" : usage.formatTokenCount(n) }
+
+  function recordedCloudWindowText(key, label) {
+    var window = recordedTotals.cloud[key]
+    return label + " " + recordedCount(window.value) + " · " + window.known + "/" + window.sources + " sources"
+      + (window.overflow ? " · sum unavailable" : "")
+  }
+
+  function recordedLocalTotalsText() {
+    var p = recordedTotals.local
+    return "Local sampled (separate) · today " + recordedCount(p.today)
+      + " · last 7 recorded days " + recordedCount(p.week) + " (" + p.recordedDays + " day" + (p.recordedDays === 1 ? "" : "s") + ")"
+      + " · recorded history " + recordedCount(p.history)
+      + "\\nEvaluated input + generated output · cached input not counted"
+  }
+
+  function recordedCodexTotalsText() {
+    var p = recordedTotals.codex
+    return "Unattributed Codex CLI · today " + recordedCount(p.today)
+      + " · last 7 recorded days " + recordedCount(p.week) + " · recorded history " + recordedCount(p.history)
+      + " · excluded from cloud subtotal / Hermes credentials"
+  }
+
+'''
+
+TOKEN_HEADER = '''      // Pinned outside the Flickable: totals cannot rotate or scroll away.
+      Column {
+        id: recordedTokenHeader
+        objectName: "recordedTokenHeader"
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        spacing: Style.space(4)
+
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: "Recorded cloud tokens · partial coverage"
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          font.bold: true
+          wrapMode: Text.WordWrap
+        }
+        Repeater {
+          model: [{key: "today", label: "Today"}, {key: "week", label: "Last 7 recorded days"}, {key: "history", label: "Recorded history"}]
+          Text {
+            required property var modelData
+            width: recordedTokenHeader.width
+            textFormat: Text.PlainText
+            text: root.recordedCloudWindowText(modelData.key, modelData.label)
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+        }
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: "Recorded subtotal, not all-account usage; not subscription lifetime. In + Out + Cache read + Cache creation. — means unavailable."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: root.recordedLocalTotalsText()
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: root.recordedCodexTotalsText()
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+      }
+
+'''
+
+TOKEN_PROVIDER_TEXT = '''    Text {
+      visible: !!section.provider && section.provider.providerId !== "local"
+      width: parent.width
+      textFormat: Text.PlainText
+      text: section.provider ? String(root.recordedTotals.byProvider[section.provider.providerId] || "") : ""
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.WrapAnywhere
+    }
+
+'''
+
+def transform_token_visibility(text):
+    """Supported limits-first layout only; every anchor is unique and required."""
+    text = replace_once(text, '  function planLabel(p) {', TOKEN_PANEL_FUNCTIONS + '  function planLabel(p) {')
+    text = replace_once(text, '    id: button\n    anchors.fill: parent\n    bar: root.bar\n    text: "󱚣"',
+                        '    id: button\n    objectName: "recordedTokenBar"\n    anchors.fill: parent\n    bar: root.bar\n    text: vertical ? root.recordedTokenCompactText : "󱚣"\n'
+                        '    labelText: vertical ? "" : root.recordedTokenBarText\n'
+                        '    tooltipText: root.recordedTokenBarText + " tokens (* = partial coverage)"\n'
+                        '    fixedWidth: vertical ? -1 : canvasSize + tokenLabelMetrics.width + Style.space(4) + scaledHorizontalMargin * 2\n'
+                        '    TextMetrics {\n      id: tokenLabelMetrics\n      text: button.labelText\n'
+                        '      font.family: button.fontFamily\n      font.pixelSize: button.fontSize\n    }')
+    text = replace_once(text, '    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(860))',
+                        '    contentHeight: panel.fittedContentHeight(recordedTokenHeader.implicitHeight + Style.space(16) + column.implicitHeight, Style.space(860))')
+    text = replace_once(text, '      Flickable {\n        id: panelFlick',
+                        TOKEN_HEADER + '      Flickable {\n        id: panelFlick\n        objectName: "recordedTokenBody"')
+    text = replace_once(text, '        anchors.fill: parent\n        anchors.leftMargin: -overhang',
+                        '        anchors.top: recordedTokenHeader.bottom\n        anchors.topMargin: Style.space(16)\n'
+                        '        anchors.bottom: parent.bottom\n        anchors.left: parent.left\n        anchors.right: parent.right\n'
+                        '        anchors.leftMargin: -overhang')
+    text = replace_once(text, '    var n = summaryPhrases.length\n    shownPhrase = n > 0 ? summaryPhrases[phraseIndex % n] : ""',
+                        '    var phrases = summaryPhrases.filter(function(text) { return text.indexOf(" tokens ") < 0 })\n'
+                        '    var n = phrases.length\n    shownPhrase = n > 0 ? phrases[phraseIndex % n] : ""')
+    anchor = "  }\n\n  // A provider's mark, falling back to the bar glyph when it ships none."
+    return replace_once(text, anchor, TOKEN_PROVIDER_TEXT + anchor)
+
 def transform_panel_limits(text):
     """Limits-first panel (omarchy-dev 4.0.0.r6694): one section per agent.
 
@@ -187,7 +470,8 @@ def transform_panel_limits(text):
                         'Qt.resolvedUrl("assets/" + iconId + "-light.svg")')
     text = replace_once(text, 'Qt.resolvedUrl("assets/" + p.providerId + ".svg")',
                         'Qt.resolvedUrl("assets/" + iconId + ".svg")')
-    return replace_once(text, '  function planLabel(p) {', LIMITS_LOCAL_FUNCTION + '  function planLabel(p) {')
+    text = replace_once(text, '  function planLabel(p) {', LIMITS_LOCAL_FUNCTION + '  function planLabel(p) {')
+    return transform_token_visibility(text)
 
 GROK_QUOTA_FUNCTIONS = '''  // A reset forecast is not an authenticated quota measurement.
   function grokQuotaFresh(p) {

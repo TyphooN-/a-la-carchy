@@ -77,6 +77,8 @@ const rows = vm.runInContext('(function()' + seed.admission + ')()', ctx, {timeo
 console.log(JSON.stringify(rows));
 '''
     funcs = ['balanceValue', 'displayProvider', 'providerHasData', 'orderedProviders', 'syncedStatsFor']
+    if 'function recordedTokenCounters(' in main:
+        funcs.append('recordedTokenCounters')
     seed = {'native': native, 'observed': observed,
             'functions': '\n'.join(function(main, name) for name in funcs),
             'admission': block(main, 'property var enabledProviders:')}
