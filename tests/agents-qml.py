@@ -225,6 +225,27 @@ ShellRoot {
     for (var i = 0; i < kids.length; i++) shownTexts(kids[i], out)
     return out
   }
+  // Inspect the instantiated provider delegate, not a plain JS provider copy:
+  // Repeater modelData converts nested limits to a Qt sequence.
+  function shownMeters(item, out) {
+    if (!item || item.visible === false) return out
+    if (typeof item.value === "number" && item.thickness !== undefined && item.markers !== undefined)
+      out.push({value: item.value, width: item.width, height: item.height})
+    var kids = item.children || []
+    for (var i = 0; i < kids.length; i++) shownMeters(kids[i], out)
+    return out
+  }
+  function shownGrokSections(item, out) {
+    if (!item || item.visible === false) return out
+    if (typeof item.providerIndex === "number" && item.provider && item.provider.providerId === "grok"
+        && item.windows !== undefined) {
+      out.push({texts: shownTexts(item, []), meters: shownMeters(item, []),
+                windows: item.windows.length, limitsIsArray: Array.isArray(item.provider.limits)})
+    }
+    var kids = item.children || []
+    for (var i = 0; i < kids.length; i++) shownGrokSections(kids[i], out)
+    return out
+  }
   Timer {
     interval: 50; repeat: true; running: !root.reported
     onTriggered: {
@@ -279,6 +300,7 @@ ShellRoot {
         local: local,
         grok: list.filter(function(p) { return p.providerId === "grok" })[0],
         grokWindows: panel.limitWindows(list.filter(function(p) { return p.providerId === "grok" })[0]),
+        grokRenderedSections: shownGrokSections(panel, []),
         grokText: panel.grokUsageText(list.filter(function(p) { return p.providerId === "grok" })[0]),
         allModelsText: panel.localRouterText({ todayTokensByModel: {"model-1": 1, "model-2": 2, "model-3": 3, "model-4": 4, "model-5": 5, "model-6": 6} }),
         localText: local ? panel.localRouterText(local) : null,
@@ -346,6 +368,15 @@ ShellRoot {
     assert result['grok']['limits'] == native_grok['limits'], result['grok']['limits']
     assert result['grok']['todayTotalTokens'] == 0
     assert len(result['grokWindows']) == 1 and result['grokWindows'][0]['percent'] == 0.75
+    sections = result['grokRenderedSections']
+    assert len(sections) == 1, 'Expected one instantiated Grok provider section: ' + repr(sections)
+    rendered = sections[0]
+    assert rendered['limitsIsArray'] is False, 'Fixture must exercise Qt sequence modelData, not a plain JS array'
+    assert rendered['windows'] == 1 and rendered['texts'].count('Weekly') == 1, \
+        'Fresh Grok Weekly row missing after Qt Repeater/modelData: ' + repr(rendered)
+    assert len(rendered['meters']) == 1, 'Grok Weekly meter missing: ' + repr(rendered)
+    meter = rendered['meters'][0]
+    assert meter['value'] == result['grokWindows'][0]['percent'] and meter['width'] > 0 and meter['height'] > 0, meter
     assert 'unavailable (not zero usage)' in result['grokText']
     assert 'Today by model: model-6 6 · model-5 5 · model-4 4 · model-3 3 · model-2 2 · model-1 1' in result['allModelsText'], result['allModelsText']
     assert '+2 more' not in result['allModelsText']
