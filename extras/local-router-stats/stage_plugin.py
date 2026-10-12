@@ -159,16 +159,22 @@ RECORDED_TOKEN_FUNCTIONS = '''  // Preserve absent counters: native numberValue(
       else for (var a = 0; a < accounts.length; a++) add(recordedTokenWindows(recordedTokenCounters(accounts[a].tokenCounters || accounts[a], id), false))
       out.byProvider[id] = recordedTokenProviderText(p, stats, accounts, aggregate)
     }
+    out.total = {}
     for (var w = 0; w < windows.length; w++) {
-      var acc = cloud[windows[w]]
+      var key = windows[w]
+      var acc = cloud[key]
       if (acc.known === 0 || acc.overflow) acc.value = null
+      var local = out.local[key]
+      var known = acc.value !== null || local !== null
+      var sum = (acc.value === null ? 0 : acc.value) + (local === null ? 0 : local)
+      out.total[key] = !known || acc.overflow || sum > 9007199254740991 ? null : sum
     }
     return out
   }
 
   // One reactive pass per data/provider/sync revision, including Local's own
   // FileView. No animation, frame or reset-clock rescans of model history.
-  readonly property var recordedTokenTotals: recordedTokenTotalsFor(enabledProviders, nativeCodexHistory.record)
+  readonly property var recordedTokenTotals: recordedTokenTotalsFor(enabledProviders, null)
 
 '''
 
@@ -183,8 +189,6 @@ def transform_main(text):
                         '  // a-la-carchy: the llama.cpp router record of this machine only.\n'
                         '  readonly property string localRouterRecordPath: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/omarchy/local-router/agents/local.json"\n\n'
                         '  Agent {\n    id: localRouterAgent\n    agentId: "local"\n    path: root.localRouterRecordPath\n  }\n\n'
-                        '  // Read native Codex history separately; never admit a duplicate provider.\n'
-                        '  Agent {\n    id: nativeCodexHistory\n    agentId: "codex"\n    path: root.usageDir + "/codex.json"\n  }\n\n'
                         '  Instantiator {\n    id: agentInstantiator')
     text = replace_once(text, '    var syncedProviders = syncConfigured() && aggregateData && aggregateData.providers ? aggregateData.providers : {}',
                         '    var localRouterRecord = localRouterAgent.record\n'
@@ -287,11 +291,11 @@ LIMITS_LOCAL_FUNCTION = '''  // a-la-carchy: what the Local section says. These 
 '''
 
 TOKEN_PANEL_FUNCTIONS = '''  readonly property var recordedTotals: usage.recordedTokenTotals
-  readonly property string recordedTokenBarText: "Cloud today " + recordedCount(recordedTotals.cloud.today.value)
-    + (recordedTotals.cloud.today.known < recordedTotals.cloud.today.sources || recordedTotals.cloud.today.value === null ? " · partial" : " · recorded")
+  readonly property string recordedTokenBarText: "Tokens today " + recordedCount(recordedTotals.total.today)
+    + (recordedTotals.cloud.today.known < recordedTotals.cloud.today.sources || recordedTotals.cloud.today.value === null || recordedTotals.local.today === null ? " · partial" : " · recorded")
 
-  readonly property string recordedTokenCompactText: recordedCount(recordedTotals.cloud.today.value)
-    + (recordedTotals.cloud.today.known < recordedTotals.cloud.today.sources || recordedTotals.cloud.today.value === null ? "*" : "")
+  readonly property string recordedTokenCompactText: recordedCount(recordedTotals.total.today)
+    + (recordedTotals.cloud.today.known < recordedTotals.cloud.today.sources || recordedTotals.cloud.today.value === null || recordedTotals.local.today === null ? "*" : "")
 
   function recordedCount(n) { return n === null ? "—" : usage.formatTokenCount(n) }
 
@@ -315,9 +319,9 @@ TOKEN_PANEL_FUNCTIONS = '''  readonly property var recordedTotals: usage.recorde
       + " · recorded " + recordedCount(p.history)
   }
 
-  function recordedCodexTotalsText() {
-    var p = recordedTotals.codex
-    return "Codex CLI · today " + recordedCount(p.today) + " · recorded " + recordedCount(p.history)
+  function recordedCombinedTotalsText() {
+    var p = recordedTotals.total
+    return "Total · today " + recordedCount(p.today) + " · recorded " + recordedCount(p.history)
   }
 
 '''
@@ -342,10 +346,10 @@ TOKEN_HEADER = '''      // Pinned totals; explanations are available on hover, n
           HoverHandler { id: tokenHelpHover }
           ToolTip.visible: tokenHelpHover.hovered
           ToolTip.delay: 300
-          ToolTip.text: "Recorded counters only. Cloud includes cache; Local is sampled and excludes cache. CLI history may share a Hermes account. — unavailable."
+          ToolTip.text: "Cloud + Local sampled. Missing account counters excluded; quota is not tokens. CLI history is not added separately. — unavailable."
         }
         Repeater {
-          model: [root.recordedCloudTotalsText(), root.recordedLocalTotalsText(), root.recordedCodexTotalsText()]
+          model: [root.recordedCombinedTotalsText(), root.recordedCloudTotalsText(), root.recordedLocalTotalsText()]
           Text {
             required property string modelData
             width: recordedTokenHeader.width

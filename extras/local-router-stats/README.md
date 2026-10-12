@@ -27,8 +27,9 @@ fail-closed: unsupported or ambiguous QML is not patched.
 
 ## Persistent recorded totals (limits-first panel)
 
-The bar keeps today's recorded cloud total visible. The popup pins compact
-Cloud, Local sampled, and Codex CLI counters, then expands to its natural height.
+The bar keeps today's known cloud-plus-Local total visible. The popup pins the
+combined total with Cloud and Local sampled breakdowns, then expands naturally.
+Native Codex CLI history is not a separate summary or added again to the total.
 It scrolls only when the current monitor cannot fit the content; provider order
 and all cards are preserved. Both native eager and first-open lazy content shapes
 are supported; mixed or partial shapes are refused. Hover the totals heading for accounting details.

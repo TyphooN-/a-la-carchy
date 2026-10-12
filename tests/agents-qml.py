@@ -512,11 +512,16 @@ ShellRoot {
     expected_count = {'recorded':'1.0K', 'zero':'0', 'missing':'—'}[CLOUD_CASE]
     expected_sources = '0/6 sources' if CLOUD_CASE == 'missing' else '1/4 sources'
     for expected in ['Recorded tokens · partial', 'Cloud · today ' + expected_count,
-                     'recorded ' + expected_count, 'Local sampled', 'Codex CLI']:
+                     'recorded ' + expected_count, 'Local sampled', 'Total · today']:
         assert expected in fixed, (expected, fixed)
     if 'content: PanelKeyCatcher {' in (STOCK/'Panel.qml').read_text():
         assert result['preOpenHeaderAbsent'], "Native lazy content must not be built at startup"
     assert result['headerRetainedOnReopen'], "Cached native content must survive closing and reopening"
+    assert 'Codex CLI' not in fixed, 'Shared-account CLI history must not be a separate summary row'
+    combined = totals = result['recordedTotals']
+    local_value = 2042 if LOCAL_CASE == 'sampled' else None
+    known = [n for n in (expected_value, local_value) if n is not None]
+    assert combined['total']['today'] == (sum(known) if known else None)
     geometry = result['pinnedGeometry']
     assert geometry['visible'] and geometry['width'] > 0 and 0 < geometry['height'] <= 140, geometry
     for redundant in ['not all-account', 'not subscription lifetime', 'unattributed', 'In + Out +', 'cache excluded', 'quota-only']:
@@ -532,17 +537,19 @@ ShellRoot {
         assert all(c['y'] >= -1 and c['y'] + c['height'] <= geometry['bodyHeight'] + 1 for c in cards), cards
     else:
         assert geometry['scrollY'] > 0 and geometry['bodyContent'] > geometry['bodyHeight'], geometry
+    n = combined['total']['today']
+    combined_count = '—' if n is None else (f'{n / 1000:.1f}K' if n >= 1000 else str(n))
     bar = result['barTokens']
     assert bar['visible'] and bar['height'] > 0, bar
     if os.environ.get('ALACARCHY_BAR_CASE') == 'vertical':
         assert bar['vertical'] and bar['width'] <= 32 and bar['text'] == '', bar
-        assert bar['glyph'] == expected_count + '*' and bar['glyph'] in bar['texts'], bar
+        assert bar['glyph'] == combined_count + '*' and bar['glyph'] in bar['texts'], bar
         assert 0 < bar['paintedWidth'] <= bar['width'], bar
     else:
-        assert bar['text'] == 'Cloud today ' + expected_count + ' · partial' and bar['width'] > 100, bar
+        assert bar['text'] == 'Tokens today ' + combined_count + ' · partial' and bar['width'] > 100, bar
     totals = result['recordedTotals']
     assert totals['cloud']['today']['value'] == expected_value and totals['cloud']['today']['known'] == (0 if CLOUD_CASE == 'missing' else 1)
-    assert totals['cloud']['history']['value'] == expected_value and totals['codex']['history'] == 1000
+    assert totals['cloud']['history']['value'] == expected_value and totals['codex']['history'] is None
     assert totals['cloud']['week']['value'] is None and totals['cloud']['week']['known'] == 0, \
         'Claude merged message counts must remain unavailable, not token totals'
     assert result['pinnedPlainText'], 'Counter labels must use plain-text sinks'

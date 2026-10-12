@@ -46,6 +46,11 @@ let quota = {providerId:'codex-hermes-1', providerName:'Codex (Hermes 1)', readO
 let t = run([cloud, local, quota, cloud], recorded('codex', 500));
 assert.equal(t.cloud.today.value, 11, 'Aggregate and accounts, Local, and duplicate provider must not be added twice');
 assert.equal(t.cloud.history.value, 20, 'History includes input/output/cache-read/cache-creation once');
+assert.equal(t.total.today, 911, 'Known cloud plus Local once, excluding separate native CLI history');
+assert.equal(t.total.history, t.cloud.history.value + t.local.history);
+assert.equal(run([cloud, local, local, quota]).total.today, 911, 'Local duplicate row counted once');
+let large = run([recorded('cloud-big',9007199254740990,{modelUsage:{}}), recorded('local',10,{recentDays:[{date:'2026-10-12',recorded:true,messageCount:10}],modelUsage:{}})]);
+assert.equal(large.total.today, null, 'Combined unsafe sum must be unavailable');
 assert.equal(t.cloud.today.sources, 2); assert.equal(t.cloud.today.known, 1);
 assert.equal(t.local.today, 900); assert.equal(t.codex.history, 509, 'Native CLI must remain separately unattributed');
 assert.match(t.byProvider.claude, /11 today/);
@@ -63,6 +68,10 @@ assert.equal(zero.cloud.today.value, 0); assert.equal(zero.cloud.today.known, 1)
 let unknown = run([quota, {providerId:'missing', todayTotalTokens:undefined}]);
 assert.equal(unknown.cloud.today.value, null); assert.equal(unknown.cloud.history.value, null);
 assert.equal(unknown.cloud.today.known, 0);
+assert.equal(unknown.total.today, null, 'No known counters must remain unavailable');
+assert.equal(zero.total.today, 0, 'Recorded zero is not unavailable');
+let mixed = run([quota, {providerId:'local', tokenCounters:{providerId:'local',hasLocalStats:true,todayTotalTokens:5,recentDays:[{date:'2026-10-12',recorded:true,messageCount:5}],modelUsage:{m:{inputTokens:5}}}}]);
+assert.equal(mixed.total.today, 5, 'Missing cloud history is excluded, not treated as measured zero');
 assert.equal(unknown.byProvider.missing, '', 'Unknown counters stay absent, not displayed as zero');
 console.log('PASS unavailable differs from recorded zero');
 let accounts = Array.from({length:137}, (_, i) => recorded('account-'+i, i, {label:'account '+i}));
