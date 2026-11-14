@@ -6392,7 +6392,7 @@ _supersonic_tool() {
         return 1
     }
     python3 "$ALC_SUPERSONIC_DIR/stage_plugin.py" \
-        --source "$OMARCHY_DIR/shell/plugins/services/media" --shell "$SHELL_JSON" \
+        --source "${ALACARCHY_SUPERSONIC_SOURCE:-$OMARCHY_DIR/shell/plugins/supersonic}" --shell "$SHELL_JSON" \
         "$1" "$HOME/.config/omarchy/plugins/alacarchy.supersonic"
 }
 _supersonic_enabled() { _supersonic_tool --check-enabled; }
@@ -6401,7 +6401,7 @@ _supersonic_enable() { _supersonic_tool --enable; }
 _supersonic_disable() { _supersonic_tool --disable; }
 enable_supersonic_music() {
     apply_shell_change "Enable Supersonic Music" \
-        "Adds native artist/track/album/year display, playback controls and library search for an already-running Supersonic. Requires this full checkout; no app installation, launch or server credentials." \
+        "Adds native artist/track/album/year display and playback controls for an already-running Supersonic. Requires this full checkout; no app installation, launch or server credentials." \
         "Supersonic music enabled" _supersonic_enabled _supersonic_enable
 }
 disable_supersonic_music() {
@@ -7248,7 +7248,7 @@ declare -a APPEARANCE_ITEMS=(
     "clock_format|Clock format|12h|24h|radio|Set the bar clock to 12-hour or 24-hour format"
     "clock_date|Clock date|Show|Hide|toggle|Show or hide the day name on the bar clock"
     "clock_seconds|Clock seconds|Show|Hide|toggle|Show HH:mm:ss (or h:mm:ss AM/PM) with second-by-second clock updates"
-    "supersonic|Supersonic music|Enable|Disable|toggle|Native Supersonic metadata, playback and song/album library search (full checkout required)"
+    "supersonic|Supersonic music|Enable|Disable|toggle|Native Supersonic metadata and playback controls (full checkout required)"
     "local_stats|Local LLM stats|Enable|Disable|toggle|Agents panel Local section: sampled llama.cpp router tokens; collection stays off until you activate it (full checkout)"
     "grok_usage|Grok tokens|Enable|Disable|toggle|Agents panel Grok tab from status-line counters; only where Omarchy has no Grok usage of its own (full checkout)"
     "window_title|Window title|Show|Hide|toggle|Show active window title on the bar next to workspaces"
