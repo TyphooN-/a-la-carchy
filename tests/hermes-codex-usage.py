@@ -49,6 +49,10 @@ class BridgeTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='hc-')
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
+        self.env = patch.dict(os.environ, {'HOME':str(self.base), 'HERMES_HOME':str(self.base),
+                              'XDG_STATE_HOME':str(self.base/'xdg'), 'TMPDIR':str(self.base)}, clear=True)
+        self.env.start()
+        self.addCleanup(self.env.stop)
         self.auth = self.base/'auth.json'
         self.auth.write_text(json.dumps({'credential_pool': {'openai-codex': [entry()]}}))
         self.auth.chmod(0o600)
@@ -80,7 +84,8 @@ class BridgeTests(unittest.TestCase):
         old = self.build([entry(subject='auth0|last-known')])
         self.m.publish(state, old)
         self.m.publish_accounts(scanner, old)
-        self.assertFalse(json.loads((scanner/'codex-hermes-1.json').read_bytes())['limitsStale'])
+        published = scanner/('codex-hermes-' + old['accounts'][0]['id'] + '.json')
+        self.assertFalse(json.loads(published.read_bytes())['limitsStale'])
         self.auth.write_text(json.dumps({'credential_pool': {'openai-codex': [
             entry(subject='auth0|last-known', expires=10**1000)]}}))
         before = self.auth.read_bytes()
@@ -90,7 +95,9 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertNotIn('Traceback', run.stderr)
         self.assertEqual(self.auth.read_bytes(), before)
-        current = json.loads((scanner/'codex-hermes-1.json').read_bytes())
+        current_paths = list(scanner.glob('codex-hermes-*.json'))
+        self.assertEqual(len(current_paths), 1)
+        current = json.loads(current_paths[0].read_bytes())
         self.assertTrue(current['limitsStale'])
         self.assertEqual(current['limits'], [])
         self.assertIn('unavailable', current['usageStatusText'])

@@ -43,6 +43,9 @@ class PublicationTests(unittest.TestCase):
     def records(self):
         return {p.name: json.loads(p.read_text()) for p in self.usage.glob('codex-hermes-*.json')}
 
+    def public_id(self, row):
+        return 'codex-hermes-' + m.identity(row['access_token'])['key']
+
     def test_state_only_run_never_touches_scanner(self):
         with patch.object(m, 'fetch', return_value=m.normalize_quota(f.quota(), f.NOW)), patch.object(m.time, 'time', return_value=f.NOW):
             self.assertTrue(m.run_once(self.home, self.state))
@@ -55,16 +58,17 @@ class PublicationTests(unittest.TestCase):
             self.assertTrue(m.run_once(self.home, self.state, usage_dir=self.usage))
         self.assertFalse((self.root/'global-state').exists())
         records = self.records()
-        self.assertEqual(sorted(records), ['codex-hermes-1.json', 'codex-hermes-2.json'])
-        for i in (1, 2):
-            r = records[f'codex-hermes-{i}.json']
-            self.assertEqual(r['id'], f'codex-hermes-{i}')
-            self.assertEqual(r['name'], f'Codex (Hermes {i})')
+        self.assertEqual(set(records), {self.public_id(row) + '.json' for row in self.rows})
+        for row in self.rows:
+            public_id = self.public_id(row)
+            r = records[public_id + '.json']
+            self.assertEqual(r['id'], public_id)
+            self.assertEqual(r['name'], f"Codex (Hermes {m.identity(row['access_token'])['key'][:8]})")
             self.assertTrue(r['readOnly'] and r['ready'])
             self.assertFalse(r['hasLocalStats'] or r['hasPromptStats'] or r['limitsStale'])
             self.assertEqual(r['limitsFetchedAt'], f.NOW*1000)
             self.assertEqual(r['limits'][0]['resetsAt'], m.iso(f.NOW+18000))
-            self.assertEqual((self.usage/f'codex-hermes-{i}.json').stat().st_mode & 0o777, 0o600)
+            self.assertEqual((self.usage/(public_id + '.json')).stat().st_mode & 0o777, 0o600)
             for forbidden in ('accounts', 'accountSwitch', 'resetCredits', 'balance', 'todayTotalTokens'):
                 self.assertNotIn(forbidden, r)
         text = ''.join(p.read_text() for p in self.root.rglob('*') if p.is_file() and p != self.auth)
@@ -75,26 +79,31 @@ class PublicationTests(unittest.TestCase):
     def test_removal_order_matching_stale_and_owned_ghosts(self):
         old = self.record()
         m.publish_accounts(self.usage, old)
+        original = self.records()
         native = self.usage/'codex.json'; native.write_text('NATIVE SENTINEL')
         foreign = self.usage/'codex-hermes-7.json'; foreign.write_text('{"sentinel":"FOREIGN SENTINEL"}')
         reversed_ = self.record(list(reversed(self.rows)), old, failure=True)
         m.publish_accounts(self.usage, reversed_)
-        self.assertEqual(self.records()['codex-hermes-1.json']['principalId'], old['accounts'][1]['id'])
-        self.assertTrue(self.records()['codex-hermes-1.json']['limitsStale'])
-        self.assertEqual(self.records()['codex-hermes-1.json']['limitsFetchedAt'], f.NOW*1000)
-        self.assertEqual(self.records()['codex-hermes-1.json']['usageStatusText'], m.REASONS['network'])
+        for row in self.rows:
+            name = self.public_id(row) + '.json'
+            current = self.records()[name]
+            self.assertEqual(current['principalId'], m.identity(row['access_token'])['key'])
+            self.assertEqual(current['name'], original[name]['name'])
+            self.assertTrue(current['limitsStale'])
+            self.assertEqual(current['limitsFetchedAt'], f.NOW*1000)
+            self.assertEqual(current['usageStatusText'], m.REASONS['network'])
         m.publish_accounts(self.usage, self.record(self.rows[:1], old))
-        self.assertFalse((self.usage/'codex-hermes-2.json').exists())
+        self.assertFalse((self.usage/(self.public_id(self.rows[1]) + '.json')).exists())
         self.assertEqual(native.read_text(), 'NATIVE SENTINEL')
         self.assertEqual(foreign.read_text(), '{"sentinel":"FOREIGN SENTINEL"}')
         m.publish_accounts(self.usage, self.record([]))
-        self.assertFalse((self.usage/'codex-hermes-1.json').exists())
+        self.assertFalse((self.usage/(self.public_id(self.rows[0]) + '.json')).exists())
         self.assertEqual(foreign.read_text(), '{"sentinel":"FOREIGN SENTINEL"}')
 
     def test_unowned_modified_symlink_nonregular_and_parent_are_refused(self):
         record = self.record()
         self.usage.mkdir(parents=True)
-        target = self.usage/'codex-hermes-1.json'
+        target = self.usage/(self.public_id(self.rows[0]) + '.json')
         sentinel = self.root/'sentinel'; sentinel.write_text('SECRET SENTINEL')
         for kind in ('foreign', 'link', 'fifo', 'directory'):
             with self.subTest(kind=kind):
@@ -120,25 +129,28 @@ class PublicationTests(unittest.TestCase):
         before = {p.name: p.read_bytes() for p in self.usage.iterdir() if p.is_file()}
         replace = m.os.replace
         calls = []
+        second = sorted(self.public_id(row) + '.json' for row in self.rows)[1]
         def failing(src, dst, **kwargs):
             calls.append(dst)
-            if str(dst) == 'codex-hermes-2.json' and len(calls) == 2: raise OSError('SECRET ERROR SENTINEL')
+            if str(dst) == second and len(calls) == 2: raise OSError('SECRET ERROR SENTINEL')
             return replace(src, dst, **kwargs)
         with patch.object(m.os, 'replace', side_effect=failing):
             with self.assertRaises(m.Unavailable) as ctx: m.publish_accounts(self.usage, self.record(list(reversed(self.rows))))
         self.assertEqual(ctx.exception.reason, 'publication')
+        self.assertIn(second, calls)
         self.assertEqual({p.name: p.read_bytes() for p in self.usage.iterdir() if p.is_file()}, before)
         self.assertFalse(any(p.name.startswith('.codex-') for p in self.usage.iterdir()))
         m.publish_accounts(self.usage, self.record(list(reversed(self.rows))))
 
     def test_publication_failure_leaves_matching_private_last_known(self):
         self.usage.mkdir(parents=True)
-        (self.usage/'codex-hermes-1.json').write_text('FOREIGN')
+        target = self.usage/(self.public_id(self.rows[0]) + '.json')
+        target.write_text('FOREIGN')
         with patch.object(m, 'fetch', return_value=m.normalize_quota(f.quota(), f.NOW)), patch.object(m.time, 'time', return_value=f.NOW):
             with self.assertRaises(m.Unavailable) as ctx: m.run_once(self.home, self.state, usage_dir=self.usage)
         self.assertEqual(ctx.exception.reason, 'publication')
         self.assertFalse(json.loads((self.state/'usage.json').read_text())['accounts'][0]['stale'])
-        self.assertEqual((self.usage/'codex-hermes-1.json').read_text(), 'FOREIGN')
+        self.assertEqual(target.read_text(), 'FOREIGN')
 
 
 if __name__ == '__main__':

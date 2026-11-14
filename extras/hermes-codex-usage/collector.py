@@ -2,8 +2,8 @@
 """Read-only Hermes Codex quotas. Stdlib only; never refreshes or selects logins.
 
 One bounded OAuth JSON snapshot, a fixed HTTPS GET per unique principal, and an
-atomic private display record. Optional --usage-dir publishes two read-only
-scanner records; no default scanner writes and no native account registration.
+atomic private display record. Optional --usage-dir publishes stable read-only
+per-principal scanner records; no default writes or native account registration.
 Tokens exist in memory and a private worker pipe, never argv, files or output.
 """
 import argparse
@@ -26,15 +26,35 @@ import time
 import unicodedata
 
 MAX_AUTH_BYTES = 4 * 1024 * 1024
-MAX_RECORD_BYTES = 128 * 1024
+MAX_RECORD_BYTES = 512 * 1024  # Covers the entire bounded 256-credential sanitized inventory.
 MAX_RESPONSE_BYTES = 64 * 1024
 MAX_ACCOUNTS = 8
+MAX_CREDENTIALS = 256
+# Presentation-only snapshot of Hermes' provider registry. Unknown/plugin/custom
+# providers are still inventoried, under a generic label; never echo their keys.
+PROVIDER_LABELS = {
+    'openai-codex':'Codex', 'openai-api':'OpenAI API', 'nous':'Nous Portal',
+    'anthropic':'Anthropic', 'openrouter':'OpenRouter', 'gemini':'Google AI Studio',
+    'xai-oauth':'Grok', 'xai':'xAI', 'qwen-oauth':'Qwen OAuth', 'lmstudio':'LM Studio',
+    'copilot':'GitHub Copilot', 'copilot-acp':'GitHub Copilot ACP', 'zai':'Z.AI',
+    'kimi-coding':'Kimi', 'kimi-coding-cn':'Kimi China', 'stepfun':'StepFun',
+    'arcee':'Arcee AI', 'gmi':'GMI Cloud', 'actual':'Actual Computer',
+    'minimax':'MiniMax', 'minimax-oauth':'MiniMax OAuth', 'minimax-cn':'MiniMax China',
+    'alibaba':'Qwen Cloud', 'alibaba-coding-plan':'Alibaba Coding Plan',
+    'deepseek':'DeepSeek', 'nvidia':'NVIDIA NIM', 'ai-gateway':'Vercel AI Gateway',
+    'opencode-zen':'OpenCode Zen', 'opencode-go':'OpenCode Go', 'kilocode':'Kilo Code',
+    'huggingface':'Hugging Face', 'xiaomi':'Xiaomi MiMo', 'tencent-tokenhub':'Tencent TokenHub',
+    'tencent-tokenplan':'Tencent TokenPlan', 'ollama-cloud':'Ollama Cloud',
+    'bedrock':'AWS Bedrock', 'vertex':'Google Vertex AI', 'azure-foundry':'Azure Foundry',
+    'unsupported':'Other provider'}
 MAX_TOKEN_BYTES = 32768
 MAX_SUBJECT_BYTES = 1024
 WORKER_TIMEOUT = 12
 AUTH_NAMESPACE = 'https://api.openai.com/auth'
 PLANS = {'free', 'plus', 'pro', 'team', 'business', 'enterprise', 'edu'}
 REASONS = {'auth': 'Hermes login unavailable — manage credentials in Hermes',
+           'inventory': 'Hermes credential inventory unavailable — invalid snapshot or explicit cardinality bound exceeded',
+           'unsupported': 'Quota unavailable — this credential type has no supported read-only quota source',
            'expired': 'Token expired — refresh login in Hermes',
            'network': 'Quota check unavailable', 'quota': 'Quota fields unavailable',
            'initial': 'Quotas not checked yet', 'busy': 'A quota check is already running',
@@ -58,24 +78,40 @@ def number(value):
         return False
 
 
-def read_json(path, maximum):
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result: raise ValueError('duplicate JSON field')
+        result[key] = value
+    return result
+
+
+def read_json(path, maximum, optional=False):
     """No links, FIFO blocking, oversized reads or auth-library side effects."""
     try:
-        info = path.lstat()
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > maximum:
-            raise Unavailable('auth')
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        parts = Path(path).absolute().parts[1:]
+        if any(p in ('.', '..') for p in parts): raise Unavailable('auth')
+        parent = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            for part in parts[:-1]:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+                os.close(parent); parent = child
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+        finally: os.close(parent)
         with os.fdopen(fd, 'rb') as stream:
             info = os.fstat(stream.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > maximum:
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_size > maximum:
                 raise Unavailable('auth')
             data = stream.read(maximum + 1)
         if len(data) > maximum:
             raise Unavailable('auth')
-        value = json.loads(data)
+        value = json.loads(data, object_pairs_hook=unique_object)
         if not isinstance(value, dict):
             raise Unavailable('auth')
         return value
+    except FileNotFoundError:
+        if optional: return {}
+        raise Unavailable('auth') from None
     except (OSError, ValueError, UnicodeError, RecursionError):
         raise Unavailable('auth') from None
 
@@ -89,6 +125,66 @@ def read_pool(path):
     if not isinstance(rows, list) or len(rows) > MAX_ACCOUNTS or any(not isinstance(r, dict) for r in rows):
         raise Unavailable('auth')
     return rows
+
+
+def inventory_pool(home):
+    """Read-only equivalent of read_credential_pool's per-provider shadowing.
+
+    No auth module imports: its corrupt-store loader can write backup files.
+    Explicit home is the active process/override chosen by the caller. Root
+    selection follows hermes_constants.get_default_hermes_root(home=...).
+    """
+    home = Path(os.path.expandvars(str(home))).expanduser().absolute()
+    native = Path.home()/('.hermes' + os.environ.get('HERMES_DATA_DIR_SUFFIX', ''))
+    try:
+        home.relative_to(native.absolute())
+        global_home = native
+    except ValueError:
+        global_home = home.parent.parent if home.parent.name == 'profiles' else home
+    def pool_at(path):
+        try: store = read_json(path/'auth.json', MAX_AUTH_BYTES, optional=True)
+        except Unavailable: raise Unavailable('inventory') from None
+        pool = store.get('credential_pool', {})
+        if not isinstance(pool, dict) or len(pool) > MAX_CREDENTIALS:
+            raise Unavailable('inventory')
+        for provider, rows in pool.items():
+            if not isinstance(provider, str) or not provider or not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
+                raise Unavailable('inventory')
+        return pool
+    active = pool_at(home)
+    global_pool = pool_at(global_home) if global_home != home else {}
+    merged = dict(global_pool)
+    for provider, rows in active.items():
+        if rows or provider not in merged: merged[provider] = rows
+    if sum(len(rows) for rows in merged.values()) > MAX_CREDENTIALS or len(merged.get('openai-codex', [])) > MAX_ACCOUNTS:
+        raise Unavailable('inventory')
+    return merged
+
+
+def credential_key(provider, row):
+    # Persisted IDs survive token refresh. Without one, fingerprint the private
+    # material; changes to that material/metadata can change the identity. Never
+    # expose unhashed hints or use row order as identity.
+    hint = row.get('id')
+    if not isinstance(hint, str) or not hint:
+        hint = row.get('access_token') or json.dumps(row, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(json.dumps([provider, hint], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def unavailable_credentials(pool):
+    result = {}
+    for provider, rows in pool.items():
+        if provider == 'openai-codex': continue
+        safe_provider = provider if provider in PROVIDER_LABELS else 'unsupported'
+        for row in rows:
+            key = credential_key(provider, row)
+            result[key] = {'id':'hermes-credential-' + key, 'principalId':key,
+                           'credentialProvider':safe_provider, 'readOnly':True, 'ready':True,
+                           'name':PROVIDER_LABELS[safe_provider] + ' (Hermes ' + key[:8] + ')',
+                           'schemaVersion':1, 'hasLocalStats':False, 'hasPromptStats':False,
+                           'tierLabel':'Hermes', 'limits':[], 'limitsStale':True, 'limitsFetchedAt':0,
+                           'usageStatusText':REASONS['unsupported'], 'authHelpText':REASONS['unsupported']}
+    return list(result.values())
 
 
 def header_value(value):
@@ -257,7 +353,7 @@ def build_record(rows, previous, probe, now):
         token = row.get('access_token')
         try: ident = identity(token)
         except Unavailable:
-            ident = {'key': hashlib.sha256(('invalid-pool-slot:' + str(ordinal)).encode()).hexdigest(), 'expires': 0}
+            ident = {'key': credential_key('openai-codex', row), 'expires': 0}
         key = ident['key']
         if key not in selected:
             selected[key] = (ordinal, token, ident)
@@ -265,7 +361,7 @@ def build_record(rows, previous, probe, now):
             selected[key] = (selected[key][0], token, ident)
     record = skeleton()
     for key, (ordinal, token, ident) in selected.items():
-        account = {'id': key, 'label': 'Hermes account ' + str(ordinal), 'readOnly': True,
+        account = {'id': key, 'label': 'Hermes account ' + key[:8], 'readOnly': True,
                    'active': False, 'limits': [], 'fetchedAt': 0, 'stale': True, 'plan': '',
                    'usageStatusText': '', 'authHelpText': ''}
         try:
@@ -312,20 +408,22 @@ def publish(state, record):
 
 PUBLICATION_MANIFEST = '.hermes-codex-publication'
 PUBLICATION_LOCK = '.hermes-codex-publication.lock'
+PUBLIC_INVENTORY = '.hermes-credential-inventory'
 
 
 def account_records(record):
-    """Only two display slots; account hashes follow current pool order."""
+    """One stable public identity per unique observed principal, never a pool slot."""
     accounts = record.get('accounts')
-    if not isinstance(accounts, list) or len(accounts) > 2: raise Unavailable('publication')
+    if not isinstance(accounts, list) or len(accounts) > MAX_ACCOUNTS: raise Unavailable('publication')
     result = {}
     for i, raw in enumerate(accounts, 1):
         clean = sanitize_old(raw)
         if not clean: raise Unavailable('publication')
         status = raw.get('usageStatusText', '')
         if status not in ('', *REASONS.values()): raise Unavailable('publication')
-        name = 'codex-hermes-' + str(i)
-        value = {'schemaVersion': 1, 'id': name, 'name': f'Codex (Hermes {i})',
+        name = 'codex-hermes-' + clean['id']
+        if name + '.json' in result: raise Unavailable('publication')
+        value = {'schemaVersion': 1, 'id': name, 'name': f"Codex (Hermes {clean['id'][:8]})",
                  'principalId': clean['id'], 'readOnly': True, 'ready': True,
                  'hasLocalStats': False, 'hasPromptStats': False,
                  'tierLabel': clean['plan'] or 'Hermes',
@@ -390,6 +488,37 @@ def publish_accounts(destination, record):
     Unregistered legacy/manual records are preserved, never adopted by name.
     """
     desired = account_records(record)
+    entries = []
+    credentials = record.get('credentials', [])
+    if not isinstance(credentials, list) or len(credentials) + len(desired) > MAX_CREDENTIALS:
+        raise Unavailable('publication')
+    for value in credentials:
+        if not isinstance(value, dict): raise Unavailable('publication')
+        key, provider = value.get('principalId'), value.get('credentialProvider')
+        if not isinstance(key, str) or not re.fullmatch(r'[a-f0-9]{64}', key) or provider not in PROVIDER_LABELS or provider == 'openai-codex':
+            raise Unavailable('publication')
+        expected = unavailable_credentials({provider:[{'id':'placeholder'}]})[0]
+        # Reconstruct the entire unavailable record, never pass private extras.
+        expected.update(id='hermes-credential-' + key, principalId=key,
+                        name=PROVIDER_LABELS[provider] + ' (Hermes ' + key[:8] + ')')
+        if expected['id'] + '.json' in desired: raise Unavailable('publication')
+        desired[expected['id'] + '.json'] = (json.dumps(expected, separators=(',', ':')) + '\n').encode()
+    for name, data in sorted(desired.items()):
+        value = json.loads(data)
+        provider = value.get('credentialProvider', 'openai-codex')
+        entries.append({'id': value['id'], 'provider': provider,
+                        'principalId': value['principalId'], 'name': value['name'],
+                        'quota': 'codex' if provider == 'openai-codex' else 'unavailable'})
+    # Identity-set generation survives refresh/sample clocks across devices.
+    # Membership changes invalidate old records during partial multi-file updates.
+    generation = hashlib.sha256(json.dumps(entries, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    for name, data in list(desired.items()):
+        value = json.loads(data)
+        value.update(inventoryGeneration=generation, credentialProvider=value.get('credentialProvider', 'openai-codex'))
+        desired[name] = (json.dumps(value, allow_nan=False, separators=(',', ':')) + '\n').encode()
+    inventory = {'schemaVersion': 1, 'contract': 'hermes-credential-inventory/1',
+                 'generation': generation, 'entries': entries}
+    desired[PUBLIC_INVENTORY] = (json.dumps(inventory, separators=(',', ':')) + '\n').encode()
     fd = None
     try:
         fd = publication_directory(destination)
@@ -404,7 +533,7 @@ def publish_accounts(destination, record):
             if manifest_before is not None:
                 meta = json.loads(manifest_before)
                 owned = meta.get('files') if isinstance(meta, dict) and meta.get('version') == 1 else None
-                if not isinstance(owned, dict) or any(not re.fullmatch(r'codex-hermes-[1-8]\.json', n)
+                if not isinstance(owned, dict) or any(not (n == PUBLIC_INVENTORY or re.fullmatch(r'(?:codex-hermes-(?:[a-f0-9]{64}|[1-8])|hermes-credential-[a-f0-9]{64})\.json', n))
                         or not isinstance(h, str) or not re.fullmatch(r'[a-f0-9]{64}', h) for n, h in owned.items()):
                     raise Unavailable('publication')
             before = {n: publication_read(fd, n) for n in sorted(set(owned) | set(desired))}
@@ -418,7 +547,7 @@ def publish_accounts(destination, record):
             staged, applied = {}, []
             try:
                 for n, data in changes.items(): staged[n] = publication_temp(fd, data)
-                for n in sorted(set(owned) | set(desired)) + [PUBLICATION_MANIFEST]:
+                for n in sorted((set(owned) | set(desired)) - {PUBLIC_INVENTORY}) + [PUBLIC_INVENTORY, PUBLICATION_MANIFEST]:
                     if publication_read(fd, n) != before[n]: raise Unavailable('publication')
                     if n in changes:
                         os.replace(staged[n], n, src_dir_fd=fd, dst_dir_fd=fd)
@@ -461,8 +590,9 @@ def run_once(home, state, initialize=False, usage_dir=None):
         try: previous = read_json(state/'usage.json', MAX_RECORD_BYTES)
         except Unavailable: previous = {}
         now = time.time()
+        pool = inventory_pool(home)
         try:
-            record = build_record(read_pool(home/'auth.json'), previous, fetch, now)
+            record = build_record(pool.get('openai-codex', []), previous, fetch, now)
         except Unavailable:
             record = skeleton(REASONS['auth'])
             raw_accounts = previous.get('accounts', [])
@@ -472,6 +602,7 @@ def run_once(home, state, initialize=False, usage_dir=None):
                     record['accounts'].append(clean | {'label': 'Hermes account ' + str(len(record['accounts'])+1),
                         'readOnly': True, 'active': False, 'stale': True,
                         'usageStatusText': REASONS['auth'], 'authHelpText': REASONS['auth']})
+        record['credentials'] = unavailable_credentials(pool)
         publish(state, record)
 
         if usage_dir is not None: publish_accounts(usage_dir, record)

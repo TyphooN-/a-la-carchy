@@ -1,0 +1,12 @@
+[Unit]
+Description=Observe existing sanitized Hermes quota/token publications
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Persistent=false
+Unit=hermes-quota-calibration.service
+
+[Install]
+WantedBy=timers.target

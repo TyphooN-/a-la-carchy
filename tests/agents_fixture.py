@@ -34,6 +34,11 @@ Item {
     model: root.agentIds
   }
 
+  function reloadRecords() {
+    for (var i = 0; i < agents.length; i++)
+      if (agents[i]) agents[i].reload()
+  }
+
   property var enabledProviders: {
     var result = []
     var syncedProviders = syncConfigured() && aggregateData && aggregateData.providers ? aggregateData.providers : {}
@@ -182,6 +187,13 @@ Panel {
         id: panelFlick
         anchors.fill: parent
         anchors.leftMargin: -overhang
+        Column {
+          id: column
+          Repeater {
+            id: providerSections
+            model: root.providers
+          }
+        }
       }
     }
   }
@@ -189,6 +201,13 @@ Panel {
   component ProviderSection: Column {
     id: section
     property var provider: null
+
+    Item {
+      Text {
+        id: sectionName
+        text: section.provider ? section.provider.providerName : ""
+      }
+    }
 
     Text {
       visible: !section.multi && root.otherTrouble(section.provider) !== ""

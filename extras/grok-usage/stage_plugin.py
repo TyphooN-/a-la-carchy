@@ -19,7 +19,7 @@ class NativeGrok(ValueError):
 
 
 def transform_main(text):
-    text = local.replace_once(text, 'name !== "local.json"', 'name !== "local.json" && name !== "grok.json"')
+    text = local.replace_once(text, 'name !== "codex.json"', 'name !== "codex.json" && name !== "grok.json"')
     text = local.replace_once(text, '  Agent {\n    id: localRouterAgent',
         '  // a-la-carchy: Grok observed counters are local-only, not subscription quota.\n'
         '  readonly property string grokObservedRecordPath: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/omarchy/grok-usage/agents/grok.json"\n'
@@ -30,9 +30,9 @@ def transform_main(text):
         '    if (grokObservedRecord && String(grokObservedRecord.id) === "grok" && providerEnabled("grok"))\n'
         '      result.push(displayProvider(grokObservedRecord))\n'
         '    var localRouterRecord = localRouterAgent.record')
-    text = local.replace_once(text, 'if (syncedId === "local") continue', 'if (syncedId === "local" || syncedId === "grok") continue')
-    text = local.replace_once(text, 'if (String(record.id) === "local") continue', 'if (String(record.id) === "local" || String(record.id) === "grok") continue')
-    return local.replace_once(text, 'if (providerId === "local") return null', 'if (providerId === "local" || providerId === "grok") return null')
+    text = local.replace_once(text, 'if (syncedId === "local-transcripts") continue', 'if (syncedId === "local-transcripts" || syncedId === "grok") continue')
+    text = local.replace_once(text, 'if (String(record.id) === "local" && !nativeLocalRecordAdmitted(record)) continue', 'if (String(record.id) === "grok" || (String(record.id) === "local" && !nativeLocalRecordAdmitted(record))) continue')
+    return local.replace_once(text, 'if (providerId === "local" && nativeLocal !== true) return null', 'if (providerId === "grok" || (providerId === "local" && nativeLocal !== true)) return null')
 
 
 def transform_panel(text):

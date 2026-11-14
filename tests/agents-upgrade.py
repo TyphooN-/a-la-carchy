@@ -655,7 +655,7 @@ class UpgradeTests(f.Fixture):
         share = self.home/'.local/share/a-la-carchy'
         installed = share/'agents-clone/manage.py'
         for relative in ('agents-clone/manage.py', 'agents-clone/upgrade.py', 'local-router-stats/stage_plugin.py',
-                         'grok-usage/stage_plugin.py', 'hermes-codex-usage/collector.py'):
+                         'local-router-stats/history_consumer.js', 'grok-usage/stage_plugin.py', 'hermes-codex-usage/collector.py'):
             self.assertEqual((share/relative).read_bytes(), (ROOT/'extras'/relative).read_bytes())
         shell = self.shell.read_bytes()
         self.new_omarchy('limits')
@@ -668,6 +668,226 @@ class UpgradeTests(f.Fixture):
         self.assertEqual((self.clone/'README.md').read_text(), '# Agents, a later release\n')
         registry = json.loads(self.registry.read_text())['files']
         self.assertEqual(registry[str(installed)], m.digest(installed.read_bytes()))
+
+    def test_installed_accounting_cli_with_repository_access_denied(self):
+        from contextlib import closing
+        import shutil
+        import sqlite3
+        import stat
+        import subprocess
+        # Install from a disposable checkout, then remove it. The actual CLI
+        # below also denies reads of the original repository, not just cwd or
+        # PYTHONPATH fallthrough. Only stdlib and installed siblings may load.
+        checkout = self.root/'installer-checkout'
+        extras = checkout/'extras'
+        dependencies = ('local-router-stats/hermes_accounting.py',
+                        'local-router-stats/usage_history.py')
+        for relative in set(m.TOOL_FILES) | set(dependencies):
+            target = extras/relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT/'extras'/relative, target)
+        command = [sys.executable, '-I', '-B', str(extras/'agents-clone/manage.py'),
+                   '--source', str(self.source), '--shell', str(self.shell),
+                   '--plugins', str(self.plugins), '--install-tools', 'local']
+        run = subprocess.run(command, cwd=self.root, env=self.env,
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        shutil.rmtree(checkout)
+        self.assertFalse(checkout.exists())
+        share = self.home/'.local/share/a-la-carchy'
+        installed = share/'local-router-stats/hermes_accounting.py'
+        output_dir = self.state/'omarchy/hermes-token-accounting'
+        output_dir.mkdir(parents=True, mode=0o700)
+        usage, state, history = (output_dir/name for name in ('usage.json', 'state.json', 'history.json'))
+        guarded_cli = r'''
+import os, runpy, sys
+forbidden, removed, script, *args = sys.argv[1:]
+assert sys.flags.isolated and sys.dont_write_bytecode
+assert not os.path.exists(removed)
+assert 'PYTHONPATH' not in os.environ
+roots = tuple(os.path.realpath(p) for p in (forbidden, removed))
+def deny_repository(event, values):
+    if event in ('open', 'os.listdir', 'os.scandir', 'os.chdir') and values:
+        path = values[0]
+        if isinstance(path, (str, bytes, os.PathLike)):
+            path = os.path.realpath(os.fsdecode(path))
+            if any(path == root or path.startswith(root + os.sep) for root in roots):
+                raise PermissionError('repository access denied by installed CLI fixture')
+sys.addaudithook(deny_repository)
+try:
+    open(os.path.join(forbidden, 'extras/agents-clone/manage.py'), 'rb')
+except PermissionError:
+    pass
+else:
+    raise AssertionError('repository read guard was not exercised')
+sys.argv = [script, *args]
+runpy.run_path(script, run_name='__main__')
+'''
+        calls = []
+        def cli(*args):
+            argv = [sys.executable, '-I', '-B', '-c', guarded_cli,
+                    str(ROOT), str(checkout), str(installed), *map(str, args)]
+            child = subprocess.run(argv, cwd=self.root, env=self.env,
+                                   capture_output=True, text=True, timeout=15)
+            calls.append({'command': argv, 'exit': child.returncode,
+                          'stdout': child.stdout, 'stderr': child.stderr})
+            self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+            self.assertEqual(child.stdout + child.stderr, '', 'successful installed CLI is quiet')
+        row = dict(session_id='PRIVATE_INSTALLED_SESSION', model='PRIVATE_INSTALLED_MODEL',
+                   billing_provider='openai-codex', billing_base_url='https://api.openai.com/v1',
+                   billing_mode='subscription_included', task='PRIVATE_INSTALLED_TASK',
+                   input_tokens=100, output_tokens=20, cache_read_tokens=30, cache_write_tokens=5,
+                   reasoning_tokens=7, api_call_count=1, first_seen=0, last_seen=1)
+        source = self.root/'canonical.json'
+        source.write_text(json.dumps({'contract': 'hermes-session-model-usage/1',
+                                     'counterSemantics': 'hermes-canonical/1', 'rows': [row]}))
+        before_json = source.read_bytes()
+        options = ['--profile', 'default', '--output', usage, '--history-state', state,
+                   '--history-output', history, '--timezone', 'UTC']
+        cli('--json', source, *options, '--observed-at', '2024-03-04T10:00:00Z')
+        baseline = json.loads(history.read_text())
+        self.assertEqual(baseline['coverage']['status'], 'baseline-only')
+        self.assertEqual(baseline['buckets'], dict(day=[], week=[], month=[], year=[]))
+        self.assertEqual(json.loads(usage.read_text())['sources'][0]['windows'],
+                         {'today': None, 'week': None, 'history': 155})
+        later = dict(row, input_tokens=110, output_tokens=24, cache_read_tokens=33,
+                     cache_write_tokens=7, reasoning_tokens=8, api_call_count=2)
+        snapshot = self.root/'canonical.sqlite'
+        columns = tuple(row)
+        with closing(sqlite3.connect(snapshot)) as db, db:
+            db.execute('CREATE TABLE session_model_usage (' + ','.join(
+                name + (' INTEGER' if name.endswith('_tokens') or name == 'api_call_count'
+                        else ' REAL' if name in ('first_seen', 'last_seen') else ' TEXT')
+                for name in columns) + ')')
+            db.execute('INSERT INTO session_model_usage VALUES (' + ','.join('?' for _ in columns) + ')',
+                       tuple(later[name] for name in columns))
+        snapshot.chmod(0o400)
+        before_sqlite = snapshot.read_bytes()
+        cli('--sqlite-snapshot', snapshot, *options, '--observed-at', '2024-03-04T10:10:00Z')
+        public = json.loads(history.read_text())
+        accounting = json.loads(usage.read_text())
+        self.assertEqual(public['contract'], 'hermes-observed-history/1')
+        self.assertEqual(public['generation'], baseline['generation'] + 1)
+        self.assertEqual(public['coverage']['status'], 'partial-observed')
+        self.assertTrue(public['coverage']['missingHistory'])
+        expected = dict(input_tokens=10, output_tokens=4, cache_read_tokens=3, cache_write_tokens=2,
+                        reasoning_tokens=1, api_call_count=1, prompt_tokens=15, total_tokens=19)
+        self.assertEqual(public['coverage']['observed'], expected)
+        for grain, key in (('day', '2024-03-04'), ('week', '2024-03-04'),
+                           ('month', '2024-03'), ('year', '2024')):
+            self.assertEqual(public['buckets'][grain], [{'key': key, 'sources': [{
+                'id': public['sources'][0]['id'], 'counts': expected, 'coveredSeconds': 600, 'intervals': 1}]}])
+        self.assertEqual(accounting['sources'][0]['windows'], {'today': None, 'week': None, 'history': 174})
+        self.assertEqual(source.read_bytes(), before_json)
+        self.assertEqual(snapshot.read_bytes(), before_sqlite)
+        files = {p.name: p.read_bytes() for p in (usage, state, history)}
+        cli('--recover-history', '--output', usage, '--history-state', state, '--history-output', history)
+        self.assertEqual({p.name: p.read_bytes() for p in (usage, state, history)}, files)
+        registry = json.loads(self.registry.read_text())['files']
+        for relative in dependencies:
+            path = share/relative
+            self.assertEqual(path.read_bytes(), (ROOT/'extras'/relative).read_bytes())
+            self.assertEqual(registry[str(path)], m.digest(path.read_bytes()))
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+        for path in (usage, state, history):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        published = usage.read_text() + history.read_text()
+        for private in ('PRIVATE_INSTALLED_SESSION', 'PRIVATE_INSTALLED_MODEL',
+                        'PRIVATE_INSTALLED_TASK', 'api.openai.com'):
+            self.assertNotIn(private, published)
+        self.assertEqual(self.systemctl_calls(), [])
+        print('INSTALLED_ACCOUNTING_PROOF=' + json.dumps({
+            'repository_checkout_removed': str(checkout), 'repository_read_denied': str(ROOT),
+            'calls': calls, 'baseline_history': baseline, 'accounting': accounting, 'history': public,
+            'installed_sha256': {relative: registry[str(share/relative)] for relative in dependencies},
+            'output_sha256': {name: m.digest(data) for name, data in files.items()},
+            'input_unchanged': {'json': m.digest(before_json), 'sqlite': m.digest(before_sqlite)},
+            'service_calls': self.systemctl_calls()}, sort_keys=True))
+
+    def test_accounting_helpers_update_registered_versions_and_keep_backups(self):
+        dependencies = ('hermes_accounting.py', 'usage_history.py')
+        self.ok('local', 'install-tools')
+        folder = self.home/'.local/share/a-la-carchy/local-router-stats'
+        registry = json.loads(self.registry.read_text())
+        older = {}
+        for name in dependencies:
+            path = folder/name
+            older[name] = ('# older registered ' + name + '\n').encode()
+            path.write_bytes(older[name])
+            path.chmod(0o600)
+            registry['files'][str(path)] = m.digest(older[name])
+        self.registry.write_text(json.dumps(registry) + '\n')
+        shell, clone = self.shell.read_bytes(), f.tree(self.clone)
+        self.ok('local', 'install-tools')
+        registered = json.loads(self.registry.read_text())['files']
+        for name in dependencies:
+            path = folder/name
+            expected = (ROOT/'extras/local-router-stats'/name).read_bytes()
+            self.assertEqual(path.read_bytes(), expected)
+            self.assertEqual(registered[str(path)], m.digest(expected))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600, 'existing helper modes are preserved')
+        backups = self.registry.parent/'agents-upgrade-backups'
+        self.assertTrue(any(all(data in [p.read_bytes() for p in (backup/'files').glob('*')]
+                                    for data in older.values()) for backup in backups.glob('tools-*')))
+        before = f.tree(self.home)
+        self.ok('local', 'install-tools')
+        self.assertEqual(f.tree(self.home), before, 'identical bundle is an exact no-op')
+        self.assertEqual(self.shell.read_bytes(), shell)
+        self.assertEqual(f.tree(self.clone), clone)
+        self.assertEqual(self.systemctl_calls(), [])
+
+    def test_accounting_helper_manual_edits_refuse_the_whole_bundle(self):
+        folder = self.home/'.local/share/a-la-carchy/local-router-stats'
+        for registered in (False, True):
+            if registered:
+                self.ok('local', 'install-tools')
+            for name in ('hermes_accounting.py', 'usage_history.py'):
+                with self.subTest(name=name, registered=registered):
+                    path = folder/name
+                    original = path.read_bytes() if path.exists() else None
+                    path.write_bytes(b'# unrecognized manual accounting edit\n')
+                    before = f.tree(self.home)
+                    run = self.run_manage('local', 'install-tools')
+                    self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+                    self.assertIn('modified or unregistered installed tool/unit', run.stdout)
+                    self.assertNotIn('Traceback', run.stderr)
+                    self.assertEqual(f.tree(self.home), before, 'refusal must precede any bundle write')
+                    if original is None:
+                        path.unlink()
+                    else:
+                        path.write_bytes(original)
+        self.assertEqual(self.systemctl_calls(), [])
+
+    def test_accounting_dependency_install_registry_failure_restores_preimages(self):
+        u = self.upgrader()
+        folder = self.home/'.local/share/a-la-carchy/local-router-stats'
+        adapter, history = folder/'hermes_accounting.py', folder/'usage_history.py'
+        adapter.write_bytes(b'# older registered accounting helper\n')
+        adapter.chmod(0o600)
+        registry = json.loads(self.registry.read_text())
+        registry['files'][str(adapter)] = m.digest(adapter.read_bytes())
+        self.registry.write_text(json.dumps(registry) + '\n')
+        self.assertFalse(history.exists())
+        before = self.home_outside_backups()
+        atomic, written = u.manage.atomic_write, []
+        def fail_registration(path, data, mode):
+            if path == self.registry:
+                raise OSError('fixture accounting dependency registration failure')
+            written.append(path)
+            return atomic(path, data, mode)
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch.object(u.manage, 'atomic_write', side_effect=fail_registration):
+            paths = self.paths()
+            replacements = [(paths.tools/name, m.checkout_bytes(name)) for name in m.TOOL_FILES]
+            with self.assertRaisesRegex(u.manage.Refused, 'tools refused/rolled back;'):
+                u.install_files(paths, replacements)
+        self.assertIn(adapter, written, 'fixture must replace the registered adapter before failing')
+        self.assertIn(history, written, 'fixture must install the missing sibling before failing')
+        self.assertEqual(self.home_outside_backups(), before)
+        self.assertEqual(adapter.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(history.exists())
+        self.assertEqual(self.systemctl_calls(), [])
+        self.assertTrue(any(self.registry.parent.glob('agents-upgrade-backups/tools-*/receipt.json')))
 
     def test_installed_bridge_unit_supplies_explicit_scanner_and_stays_inactive(self):
         import shlex
@@ -692,7 +912,14 @@ class UpgradeTests(f.Fixture):
         self.assertIn('/a-la-carchy/hermes-codex-usage/collector.py', command[2])
         run = subprocess.run(command, cwd=self.root, env=self.env, capture_output=True, text=True, timeout=15)
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(sorted(p.name for p in scanner.glob('*.json')), ['codex-hermes-1.json', 'codex-hermes-2.json'])
+        rows = json.loads(auth.read_text())['credential_pool']['openai-codex']
+        bridge_spec = importlib.util.spec_from_file_location('installed_bridge_contract', ROOT/'extras/hermes-codex-usage/collector.py')
+        assert bridge_spec is not None and bridge_spec.loader is not None
+        bridge = importlib.util.module_from_spec(bridge_spec); bridge_spec.loader.exec_module(bridge)
+        expected = {'codex-hermes-' + bridge.identity(row['access_token'])['key'] + '.json' for row in rows}
+        self.assertEqual({p.name for p in scanner.glob('*.json')}, expected)
+        inventory = json.loads((scanner/bridge.PUBLIC_INVENTORY).read_text())
+        self.assertEqual({e['id'] + '.json' for e in inventory['entries']}, expected)
         self.assertEqual(auth.read_bytes(), original)
         self.assertEqual(self.systemctl_calls(), [])
         self.assertFalse((unit.parent/'timers.target.wants').exists())

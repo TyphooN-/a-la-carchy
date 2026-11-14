@@ -198,5 +198,54 @@ def main():
         ledger.db.close()
 
 
+
+def import_hermes_grok(ledger, now):
+    """When Grok is used through the Hermes harness (not direct Grok CLI), pull the
+    token usage from Hermes state.db (session_model_usage for grok/xai models) and
+    feed it into the ledger so the Omarchy Agents panel sees the tokens for the
+    "Grok" line and can sum into Cloud.
+    """
+    hermes_db_path = Path.home() / ".hermes" / "state.db"
+    if not hermes_db_path.exists():
+        return
+    try:
+        hdb = sqlite3.connect(str(hermes_db_path), timeout=5)
+        # aggregate per day and model
+        rows = hdb.execute("""
+            SELECT
+                date(datetime(first_seen, "unixepoch")) as day,
+                COALESCE(model, "grok-build-0.1") as model,
+                SUM(COALESCE(input_tokens, 0)) as i,
+                SUM(COALESCE(output_tokens, 0)) as o,
+                SUM(COALESCE(cache_read_tokens, 0)) as r,
+                SUM(COALESCE(cache_write_tokens, 0)) as w
+            FROM session_model_usage
+            WHERE (model LIKE "%grok%" OR billing_provider LIKE "%grok%" OR billing_provider LIKE "%xai%")
+              AND (input_tokens > 0 OR output_tokens > 0)
+            GROUP BY day, model
+            ORDER BY day
+        """).fetchall()
+        for day, model, i, o, r, w in rows:
+            i, o, r, w = int(i or 0), int(o or 0), int(r or 0), int(w or 0)
+            if i + o + r + w == 0:
+                continue
+            # insert directly to daily and coverage
+            with ledger.db:
+                ledger.db.execute("INSERT OR IGNORE INTO coverage VALUES (?)", (day,))
+                ledger.db.execute("""
+                    INSERT INTO daily (day, model, i, o, r, w)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(day, model) DO UPDATE SET
+                        i = i + excluded.i,
+                        o = o + excluded.o,
+                        r = r + excluded.r,
+                        w = w + excluded.w
+                """, (day, model, i, o, r, w))
+        hdb.close()
+    except Exception as e:
+        print("hermes grok import err", e, file=sys.stderr)
+        pass
+
+
 if __name__ == '__main__':
     main()

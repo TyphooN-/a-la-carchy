@@ -497,12 +497,30 @@ class TabsLayout(Fixture):
         main = (self.clone/'Main.qml').read_text()
         self.assertIn('/omarchy/local-router/agents/local.json', main)
         self.assertIn('/omarchy/grok-usage/agents/grok.json', main)
-        self.assertIn('name !== "local.json" && name !== "grok.json"', main)
+        self.assertIn('name !== "codex.json" && name !== "grok.json"', main)
         self.assertEqual([p.name for p in self.plugins.iterdir()], ['alacarchy.agents'], 'no hidden staging leftovers')
         self.assertEqual(tree(self.source), self.pristine_source, 'packaged source untouched')
         self.assertEqual(manifest['name'], 'Agents + Local + Grok tokens')
         self.assertEqual(manifest['omarchy']['alaCarchyLayout'], 'tabs')
         self.assertRegex(manifest['omarchy']['alaCarchySource'], r'^[0-9a-f]{64}$')
+
+    def test_managed_clock_bundle_runs_without_repository_imports(self):
+        self.ok('local', 'enable')
+        helper = self.clone/'CalendarClock.py'
+        expected = (ROOT/'extras/local-router-stats/calendar_clock.py').read_bytes()
+        self.assertEqual(helper.read_bytes(), expected)
+        manifest = json.loads((self.clone/'manifest.json').read_text())
+        self.assertEqual(manifest['omarchy']['managedFiles']['CalendarClock.py'], hashlib.sha256(expected).hexdigest())
+        installed = self.home/'.local/share/a-la-carchy/local-router-stats/calendar_clock.py'
+        self.ok('local', 'install-tools')
+        self.assertEqual(installed.read_bytes(), expected)
+        for path in (helper, installed):
+            child = subprocess.run(['/usr/bin/python3', '-I', '-B', str(path), '--timezone', 'UTC', '--now', '1709219130'],
+                                   cwd=self.root, env=dict(self.env, TZ='UTC'), capture_output=True, text=True, timeout=5)
+            self.assertEqual(child.returncode, 0, child.stderr)
+            clock = json.loads(child.stdout)
+            self.assertEqual(clock['keys'], {'day':'2024-02-29','week':'2024-02-26','month':'2024-02','year':'2024'})
+            self.assertTrue(clock['localCalendarAligned'])
 
     def test_check_modes_are_quiet(self):
         for feature in ('local', 'grok'):
@@ -672,8 +690,12 @@ class LimitsLayoutNativeGrok(Fixture):
         main = (self.clone/'Main.qml').read_text()
         panel = (self.clone/'Panel.qml').read_text()
         self.assertIn('/omarchy/local-router/agents/local.json', main)
-        self.assertIn('name.slice(-5) === ".json" && name !== "local.json" && name !== "codex.json") ids.push', main)
-        self.assertNotIn('grok', main.lower(), 'native Grok admission must not be filtered, renamed or shadowed')
+        listing = main.split('  function applyAgentListing(output) {', 1)[1].split('\n  }\n', 1)[0]
+        admission = main.split('  function providerEnabled(id) {', 1)[1].split('\n  }\n', 1)[0]
+        self.assertIn('name !== "local-transcripts.json" && name !== "codex.json"', listing)
+        self.assertIn('hermesEntry(name.slice(0, -5))', listing)
+        self.assertNotIn('grok', listing.lower(), 'native Grok filename must not be filtered')
+        self.assertNotIn('grok', admission.lower(), 'native Grok provider must not be blocked')
         self.assertIn('function grokQuotaFresh(p)', panel)
         self.assertIn('function grokUsageText(p)', panel)
         self.assertNotIn('grokObservedAgent', main)
@@ -733,6 +755,16 @@ class InstalledSource(Fixture):
 
     def make_source(self):
         shutil.copytree(STOCK, self.source)
+        # The current native panel imports its sibling reorder model; copy that
+        # admitted dependency as well, so the copied fixture graph is complete.
+        if b'import "../panels/elsewhen/Model.js" as Reorder\n' in (STOCK/'Panel.qml').read_bytes():
+            dependency = self.source.parent/'panels/elsewhen/Model.js'
+            dependency.parent.mkdir(parents=True)
+            shutil.copyfile(STOCK.parent/'panels/elsewhen/Model.js', dependency)
+        if b'import "../panels/tailscale" as Tailscale\n' in (STOCK/'Panel.qml').read_bytes():
+            dependency = self.source.parent/'panels/tailscale/TailscaleIcon.qml'
+            dependency.parent.mkdir(parents=True)
+            shutil.copyfile(STOCK.parent/'panels/tailscale/TailscaleIcon.qml', dependency)
 
     def native_grok(self):
         providers = json.loads((STOCK/'manifest.json').read_text()).get('barWidget', {}).get('defaults', {}).get('providers', {})
@@ -753,15 +785,25 @@ class InstalledSource(Fixture):
     def test_local_icons_follow_native_dark_and_light_surface_convention(self):
         self.ok('local', 'enable')
         hashes = self.manifest()['omarchy']['managedFiles']
+        names = ('local.svg', 'local-light.svg')
+        # Current Omarchy ships its own Local marks; those stay native and none are mixed in.
+        native = {name: (STOCK/'assets'/name).read_bytes() for name in names if (STOCK/'assets'/name).is_file()}
         icons = []
-        for name in ('local.svg', 'local-light.svg'):
+        for name in names:
             path = self.clone/'assets'/name
+            if native and name not in native:
+                self.assertFalse(path.exists(), 'clone mark mixed into the native Local set: ' + name)
+                continue
             self.assertTrue(path.is_file(), 'Local provider mark is missing: ' + name)
             data = path.read_bytes()
-            self.assertIn(b'viewBox="0 0 24 24"', data)
+            if native:
+                self.assertEqual(data, native[name], 'native Local mark was replaced: ' + name)
+            else:
+                self.assertIn(b'viewBox="0 0 24 24"', data)
             self.assertEqual(hashes['assets/' + name], hashlib.sha256(data).hexdigest())
             icons.append(data)
-        self.assertNotEqual(icons[0], icons[1], 'light and dark surfaces need contrasting marks')
+        if len(icons) == len(names):
+            self.assertNotEqual(icons[0], icons[1], 'light and dark surfaces need contrasting marks')
         # The dev-channel Grok marks and collector admission stay first-party.
         for path in (self.source/'assets').iterdir():
             self.assertEqual((self.clone/'assets'/path.name).read_bytes(), path.read_bytes())

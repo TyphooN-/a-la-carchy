@@ -1,0 +1,12 @@
+[Unit]
+Description=Explicit canonical Hermes accounting feed (opt-in)
+
+[Service]
+Type=oneshot
+UMask=0077
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+TimeoutStartSec=20s
+TimeoutStopSec=5s
+KillMode=control-group
+ExecStart=@EXEC_START@

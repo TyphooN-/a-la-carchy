@@ -2,6 +2,7 @@
 """Execute the real Agents provider admission with offline Grok records."""
 import argparse
 import json
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -50,6 +51,25 @@ def function(text, name):
     return text[start:text.index('{', start)] + block(text, anchor)
 
 
+def root_functions(text, names):
+    # Retain the real inventory/quota dependency family. Other native boundary
+    # services (settings, sync, numberValue) remain explicitly supplied by the
+    # private fixture; importing unrelated root functions would override them.
+    available = {name: function(text, name) for name in re.findall(r'^  function (\w+)\(', text, re.M)}
+    boundaries = {'providerEnabled', 'syncConfigured', 'numberValue'}
+    selected, pending = set(), list(names)
+    while pending:
+        name = pending.pop()
+        if name in selected or name in boundaries or name not in available:
+            continue
+        selected.add(name)
+        # Native root declarations have a known shape. Follow their actual
+        # function-call closure rather than guessing a growing list of families.
+        pending.extend(candidate for candidate in available if candidate not in selected
+                       and re.search(r'\b' + re.escape(candidate) + r'\s*\(', available[name]))
+    return '\n'.join(body for name, body in available.items() if name in selected)
+
+
 def providers(main):
     native = {
         'id': 'grok', 'name': 'Grok', 'ready': True, 'tierLabel': 'fixture plan',
@@ -71,6 +91,8 @@ const ctx = {
   providerOrder: [], aggregateData: {}, syncConfigured: () => false,
   providerEnabled: () => true, numberValue: v => Number(v) || 0
 };
+ctx.root = ctx;
+ctx.Commons = {I18n:{t:text=>text}};
 vm.createContext(ctx);
 vm.runInContext(seed.functions, ctx, {timeout: 1000});
 const rows = vm.runInContext('(function()' + seed.admission + ')()', ctx, {timeout: 1000});
@@ -80,7 +102,7 @@ console.log(JSON.stringify(rows));
     if 'function recordedTokenCounters(' in main:
         funcs.append('recordedTokenCounters')
     seed = {'native': native, 'observed': observed,
-            'functions': '\n'.join(function(main, name) for name in funcs),
+            'functions': root_functions(main, funcs),
             'admission': block(main, 'property var enabledProviders:')}
     p = subprocess.run([shutil.which('node') or 'node', '-e', code, json.dumps(seed)],
                        text=True, capture_output=True, timeout=5)
@@ -97,7 +119,7 @@ def panel_quota(panel):
             source_functions.append(extra)
     code = '''const vm = require('node:vm');
 const seed = JSON.parse(process.argv[1]);
-const ctx = {nowMs: Date.parse(seed.now), usage: {setting: (k, fallback) => fallback}};
+const ctx = {nowMs: Date.parse(seed.now), usage: {setting: (k, fallback) => fallback}, Commons:{I18n:{t:text=>text}}};
 ctx.root = ctx;
 vm.createContext(ctx);
 vm.runInContext(seed.functions, ctx, {timeout: 1000});
@@ -127,7 +149,7 @@ const result = {
 };
 console.log(JSON.stringify(result));
 '''
-    seed = {'now': now, 'functions': '\n'.join(function(panel, n) for n in source_functions)}
+    seed = {'now': now, 'functions': root_functions(panel, source_functions)}
     p = subprocess.run([shutil.which('node') or 'node', '-e', code, json.dumps(seed)],
                        text=True, capture_output=True, timeout=5)
     if p.returncode:
@@ -149,7 +171,7 @@ def panel_models(panel):
     code = '''const vm = require('node:vm');
 const seed = JSON.parse(process.argv[1]);
 const ctx = {nowMs: Date.parse('2026-10-11T16:00:00Z'),
-             usage: {setting: (k, fallback) => fallback, formatTokenCount: v => String(v)}};
+             usage: {setting: (k, fallback) => fallback, formatTokenCount: v => String(v)}, Commons:{I18n:{t:text=>text}}};
 ctx.root = ctx;
 vm.createContext(ctx);
 vm.runInContext(seed.functions, ctx, {timeout: 1000});
@@ -162,7 +184,7 @@ const zero = {...record, modelUsage: {'fixture-zero': {inputTokens: 0, outputTok
 const format = v => typeof ctx.grokUsageText === 'function' ? ctx.grokUsageText(v) : '';
 console.log(JSON.stringify({recorded: format(record), unknown: format(unknown), zero: format(zero)}));
 '''
-    seed = {'functions': '\n'.join(function(panel, name) for name in names)}
+    seed = {'functions': root_functions(panel, names)}
     p = subprocess.run([shutil.which('node') or 'node', '-e', code, json.dumps(seed)],
                        text=True, capture_output=True, timeout=5)
     assert p.returncode == 0, p.stderr

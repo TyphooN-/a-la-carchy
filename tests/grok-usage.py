@@ -177,10 +177,10 @@ class Tests(unittest.TestCase):
         self.assertEqual(manifest['omarchy']['alaCarchy'], 'local-router-stats/1;grok-observed-stats/1')
         self.assertEqual(manifest['omarchy']['alaCarchyLayout'], 'tabs')
         main, panel = (target/'Main.qml').read_text(), (target/'Panel.qml').read_text()
-        for snippet in ['name !== "local.json" && name !== "grok.json"', '/omarchy/grok-usage/agents/grok.json', 'id: grokObservedAgent',
-                        'result.push(displayProvider(grokObservedRecord))', 'if (syncedId === "local" || syncedId === "grok") continue',
-                        'if (String(record.id) === "local" || String(record.id) === "grok") continue',
-                        'if (providerId === "local" || providerId === "grok") return null']:
+        for snippet in ['name !== "codex.json" && name !== "grok.json"', '/omarchy/grok-usage/agents/grok.json', 'id: grokObservedAgent',
+                        'result.push(displayProvider(grokObservedRecord))', 'if (syncedId === "local-transcripts" || syncedId === "grok") continue',
+                        'if (String(record.id) === "grok" || (String(record.id) === "local" && !nativeLocalRecordAdmitted(record))) continue',
+                        'if (providerId === "grok" || (providerId === "local" && nativeLocal !== true)) return null']:
             self.assertEqual(main.count(snippet), 1, snippet)
         for snippet in ['(p.providerId === "local" || p.providerId === "grok") ? rows : rows.slice(0, 4)',
                         '(p.providerId === "local" || p.providerId === "grok") ? id : usage.friendlyModelName(id),', '"Observed uncached input "']:

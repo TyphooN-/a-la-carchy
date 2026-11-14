@@ -10,6 +10,52 @@ Grok is retained once, including its quota; the optional custom Grok fallback
 is refused when the native manifest supports it. Local's sampled evaluated-input
 and generated-output counters and recording gaps stay on this machine.
 
+## Native agent controls in A La Carchy
+
+Open **Agents → Native agent collectors** in the full-checkout configurator.
+The dialog discovers provider IDs from the installed native Agents manifest,
+shows their effective enabled state, and asks separately before each change
+(even when global Apply all is selected). Disabling a provider writes
+`providers.<id>.enabled = false` on the actual native or verified managed widget.
+The native `updateCommand()` passes `--except <id>` to its updater, which skips
+that collector before invoking it. Thus a disabled collector cannot trigger its
+usage-tool `mise` setup through this shell refresh path. Re-enabling allows the
+ordinary future refresh again; opening/changing the menu runs no collector,
+package install, inference, login or service command itself.
+
+These controls cover **native collectors**, not independently scheduled Hermes
+quota bridges, the canonical accounting feed, or the Local sampler. Those keep
+their existing activation/feature controls. No history or account data is deleted.
+An already-running native refresh may finish; future shell-triggered refreshes
+honor the new setting. An explicit updater invocation outside the shell must
+supply its own exclusions.
+
+Settings preserve unrelated provider metadata and the layout. A managed entry's
+saved native original is updated too, so disabling the Local clone later does
+not resurrect a disabled native collector. Changed settings create a private
+byte-exact `shell.json.backup.agents-*`; repeating the same state is a no-op.
+The displayed binding covers source contract and configuration identity/bytes;
+a concurrent edit, malformed settings, unknown native provider or unverifiable
+clone is refused. Advisory locking and final preimage checks are not atomic CAS
+against a hostile same-UID writer. Reopen the dialog after a refusal instead of
+forcing an old selection. Enable the provider to reverse its disabled setting.
+
+The standalone installed manager supports the same guarded controls:
+
+```sh
+# Read-only JSON: providers plus the exact binding needed for a subsequent change.
+python3 -I -B extras/agents-clone/manage.py --source /path/to/native/agents \
+  --shell /path/to/shell.json --providers
+# Use the binding just displayed; do not substitute a guessed value.
+python3 -I -B extras/agents-clone/manage.py --source /path/to/native/agents \
+  --shell /path/to/shell.json --set-provider fireworks disabled \
+  --expected-shell "$binding"
+```
+
+The managed tool bundle includes `providers.py` and the function-only `menu.sh`.
+The full configurator still requires its complete checkout; installing maintenance
+tools does not replace an unrelated user configurator or change its launch path.
+
 ## No activation by installation
 
 The commands below are **future installation instructions**, not evidence of a
@@ -42,14 +88,33 @@ review receipt before using any installation command.
 ```
 
 `--install-tools` installs `manage.py`, `upgrade.py`, both stagers, both Local
-and optional Grok collectors, the Local service template and the Hermes quota
-collector under `~/.local/share/a-la-carchy/`. Every file is registered by hash
+and optional Grok collectors, the Local service template, `history_consumer.js`,
+the Hermes quota collector, and the explicit-input accounting pair
+`local-router-stats/hermes_accounting.py` / `local-router-stats/usage_history.py`
+under `~/.local/share/a-la-carchy/`. Every file is registered by hash
 in `managed-files.json`. Unknown differing programs are refused **before any
 writes**. Byte-identical copies may be registered; registered prior versions
 can be replaced. Installing from a newly reviewed checkout updates the installed
 bundle; `--upgrade` then regenerates from the explicit native source using those
-installed stagers. Repeating `--enable` alone does not regenerate an in-use clone.
-The installed CLI needs neither repository paths nor the configurator to run.
+installed stagers. `--upgrade` does not refresh the tool bundle, and repeating
+`--enable` alone does not regenerate an in-use clone. The installed CLIs need
+neither repository paths nor the configurator to run.
+
+The accounting CLI's history option loads its installed sibling `usage_history.py`;
+copying only the adapter is not a complete history installation. It still requires
+explicit canonical JSON or a standalone read-only snapshot, explicit output paths
+and observation options; see [the accounting contract](../local-router-stats/HERMES_ACCOUNTING.md).
+Packaging this pair adds no snapshot producer, scheduler or automatic live data
+ingestion. `--install-bridge` includes the same pair but its inactive quota timer
+does **not** feed token accounting/history.
+
+The dormant `--install-accounting-feed` renderer also accepts the optional
+`--accounting-max-source-bytes` value and forwards it to the feed's existing
+`--max-source-bytes` option. It is valid only for that installation mode. The
+feed validates its decimal byte value and hard 4 GiB main-file ceiling; omitting
+the option preserves the default 1 GiB ceiling and original unit bytes. This
+does not increase sidecar, row, time or memory limits, discover/read a database,
+or activate any service/timer.
 
 ## Hermes scanner publication: explicit and inactive
 

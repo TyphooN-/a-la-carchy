@@ -1,0 +1,9 @@
+[Unit]
+Description=Passive Hermes Codex quota/token calibration (sanitized files only)
+
+[Service]
+Type=oneshot
+UMask=0077
+NoNewPrivileges=yes
+TimeoutStartSec=15s
+ExecStart=@EXEC_START@

@@ -38,11 +38,22 @@ CLONE_WITHOUT_GROK = ('the staged ' + CLONE_ID + ' clone in use has no Grok tab;
 ENTRY_KEY = '_alaCarchyAgents'
 FEATURES = ('local', 'grok')
 UNIT = 'local-router-stats.service'
-TOOL_FILES = ('agents-clone/manage.py', 'agents-clone/upgrade.py',
-              'local-router-stats/stage_plugin.py', 'local-router-stats/collector.py',
+TOOL_FILES = ('agents-clone/manage.py', 'agents-clone/upgrade.py', 'agents-clone/providers.py',
+              'agents-clone/menu.sh',
+              'local-router-stats/stage_plugin.py', 'local-router-stats/native_navigation.py',
+              'local-router-stats/collector.py',
+              'local-router-stats/history_consumer.js', 'local-router-stats/calendar_clock.py',
+              'local-router-stats/hermes_accounting.py', 'local-router-stats/usage_history.py',
+              'local-router-stats/canonical_feed.py', 'local-router-stats/canonical-feed.service.in',
+              'local-router-stats/canonical-feed.timer',
+              'local-router-stats/quota_calibration.py', 'local-router-stats/quota-calibration.service.in',
+              'local-router-stats/quota-calibration.timer',
               'local-router-stats/local-router-stats.service', 'grok-usage/stage_plugin.py',
               'grok-usage/collector.py', 'hermes-codex-usage/collector.py')
 EXTRAS = Path(__file__).resolve().parents[1]
+ACCOUNTING_OPTIONS = {'source': 'source-db', 'profile': 'profile', 'timezone': 'timezone',
+                      'canonical-output': 'canonical-output', 'state': 'history-state',
+                      'history-output': 'history-output', 'output': 'output'}
 MAX_CONFIG = 1024 * 1024
 BLOCK_START = '# >>> a-la-carchy grok-usage (managed by A La Carchy)'
 BLOCK_END = '# <<< a-la-carchy grok-usage'
@@ -81,6 +92,12 @@ class Paths:
         self.bridge_collector = share/'hermes-codex-usage/collector.py'
         self.bridge_unit = config/'systemd/user/hermes-codex-usage.service'
         self.bridge_timer = self.bridge_unit.with_suffix('.timer')
+        self.accounting_collector = share/'local-router-stats/canonical_feed.py'
+        self.accounting_unit = config/'systemd/user/hermes-canonical-feed.service'
+        self.accounting_timer = self.accounting_unit.with_suffix('.timer')
+        self.accounting_config = {key: getattr(args, 'accounting_' + key.replace('-', '_'), None)
+                                  for key in ACCOUNTING_OPTIONS}
+        self.accounting_max_source_bytes = getattr(args, 'accounting_max_source_bytes', None)
         self.bridge_home = getattr(args, 'hermes_home', None) or Path(os.environ.get('HERMES_HOME') or home/'.hermes')
         self.bridge_state = state/'omarchy/hermes-codex'
         self.bridge_usage = state/'omarchy/agents/usage'
@@ -763,10 +780,54 @@ def bridge_units(paths):
     return [(paths.bridge_unit, service.encode()), (paths.bridge_timer, timer.encode())]
 
 
-def install_tools(paths, bridge=False):
+def accounting_units(paths):
+    """Render explicit dormant units only. Never open a DB, start a unit or discover a source."""
+    values = paths.accounting_config
+    if any(not value for value in values.values()):
+        raise Refused('accounting feed requires all explicit source/profile/timezone/destination options')
+    feed = load('alc_feed_render', EXTRAS/'local-router-stats/canonical_feed.py')
+    history = feed.adapter_module().history_module()
+    try:
+        history.label(values['profile']); history.calendar_zone(values['timezone'])
+    except ValueError:
+        raise Refused('invalid accounting profile or timezone') from None
+    arguments = ['/usr/bin/python3', '-I', '-B', paths.accounting_collector]
+    path_values = []
+    for key, option in ACCOUNTING_OPTIONS.items():
+        value = values[key]
+        if key not in ('profile', 'timezone'):
+            path = Path(value)
+            if not path.is_absolute() or str(path) != os.path.abspath(path):
+                raise Refused('accounting paths must be explicit absolute normalized paths')
+            path_values.append(str(path))
+        arguments.extend(('--' + option, value))
+    if len(path_values) != len(set(path_values)):
+        raise Refused('accounting source and destinations must differ')
+    max_source_bytes = getattr(paths, 'accounting_max_source_bytes', None)
+    if max_source_bytes is not None:
+        try:
+            feed.byte_count(max_source_bytes)
+        except (argparse.ArgumentTypeError, TypeError, ValueError):
+            raise Refused('invalid accounting source byte ceiling') from None
+        arguments.extend(('--max-source-bytes', max_source_bytes))
+    def argument(value):
+        text = str(value)
+        if not text or any(ord(c) < 32 or ord(c) == 127 for c in text):
+            raise Refused('invalid accounting unit argument')
+        return json.dumps(text.replace('%', '%%').replace('$', '$$'), ensure_ascii=False)
+    command = ' '.join(argument(value) for value in arguments)
+    template = checkout_bytes('local-router-stats/canonical-feed.service.in')
+    if template.count(b'@EXEC_START@') != 1:
+        raise Refused('invalid accounting unit template')
+    return [(paths.accounting_unit, template.replace(b'@EXEC_START@', command.encode())),
+            (paths.accounting_timer, checkout_bytes('local-router-stats/canonical-feed.timer'))]
+
+
+def install_tools(paths, bridge=False, accounting=False):
     helper = load('alc_agents_install', EXTRAS/'agents-clone/upgrade.py')
     replacements = [(paths.tools/name, checkout_bytes(name)) for name in TOOL_FILES]
     if bridge: replacements += bridge_units(paths)
+    if accounting: replacements += accounting_units(paths)
     try:
         result = helper.install_files(paths, replacements)
     except helper.manage.Refused as exc:
@@ -794,13 +855,31 @@ def main():
     parser.add_argument('--shell', type=Path, required=True)
     parser.add_argument('--plugins', type=Path)
     parser.add_argument('--hermes-home', type=Path, help='Install bridge only: explicit Hermes profile directory (no auth read)')
+    for option in ACCOUNTING_OPTIONS:
+        parser.add_argument('--accounting-' + option, help='Dormant accounting feed only: explicit ' + option)
+    parser.add_argument('--accounting-max-source-bytes',
+                        help='Dormant accounting feed only: explicit main-file byte ceiling; feed defaults and hard limits apply')
     modes = parser.add_mutually_exclusive_group(required=True)
-    for mode in ('enable', 'disable', 'upgrade', 'install-tools', 'install-bridge', 'check-enabled', 'check-disabled'):
+    for mode in ('enable', 'disable', 'upgrade', 'install-tools', 'install-bridge', 'install-accounting-feed', 'check-enabled', 'check-disabled', 'providers'):
         modes.add_argument('--' + mode, action='store_const', dest='mode', const=mode)
+    modes.add_argument('--set-provider', nargs=2, metavar=('ID', 'enabled|disabled'),
+                       help='Native collector settings only; requires --expected-shell from --providers')
+    parser.add_argument('--expected-shell', help='Exact displayed provider settings binding; no force overwrite')
     parser.add_argument('--preimage', type=Path, help='Upgrade only: exact caller-authorized task preimage JSON; no force override')
-    parser.add_argument('feature', choices=FEATURES)
+    parser.add_argument('feature', choices=FEATURES, nargs='?')
     args = parser.parse_args()
+    if args.set_provider is not None: args.mode = 'set-provider'
+    if args.mode not in ('providers', 'set-provider') and args.feature is None:
+        parser.error('feature is required for this operation')
+    if args.mode in ('providers', 'set-provider') and args.feature is not None:
+        parser.error('provider settings do not take a Local/Grok feature')
+    if (args.expected_shell is not None) != (args.mode == 'set-provider'):
+        parser.error('--set-provider requires --expected-shell, which is not used by other operations')
     if args.preimage is not None and args.mode != 'upgrade': parser.error('--preimage requires --upgrade')
+    if args.mode != 'install-accounting-feed' and (
+            any(getattr(args, 'accounting_' + k.replace('-', '_')) is not None for k in ACCOUNTING_OPTIONS)
+            or args.accounting_max_source_bytes is not None):
+        parser.error('accounting options require --install-accounting-feed')
     paths = Paths(args)
     if args.mode.startswith('check-'):
         try:
@@ -808,8 +887,13 @@ def main():
         except Exception:
             return 1  # a state that cannot be read is neither enabled nor disabled
     try:
-        if args.mode == 'upgrade': upgrade(paths, args.preimage)
-        elif args.mode in ('install-tools', 'install-bridge'): install_tools(paths, args.mode == 'install-bridge')
+        if args.mode in ('providers', 'set-provider'):
+            helper = load('alc_agents_providers', EXTRAS/'agents-clone/providers.py')
+            result = helper.control(paths, sys.modules[__name__], args.set_provider, args.expected_shell)
+            print(json.dumps(result, sort_keys=True))
+        elif args.mode == 'upgrade': upgrade(paths, args.preimage)
+        elif args.mode in ('install-tools', 'install-bridge', 'install-accounting-feed'):
+            install_tools(paths, args.mode == 'install-bridge', args.mode == 'install-accounting-feed')
         else: (enable if args.mode == 'enable' else disable)(paths, args.feature)
         return 0
     except Refused as exc:

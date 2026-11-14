@@ -1,0 +1,12 @@
+[Unit]
+Description=Explicit canonical Hermes accounting observations (opt-in)
+
+[Timer]
+OnStartupSec=2min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Persistent=false
+Unit=hermes-canonical-feed.service
+
+[Install]
+WantedBy=timers.target

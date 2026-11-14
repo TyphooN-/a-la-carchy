@@ -41,7 +41,8 @@ function recorded(id, n, extra = {}) {
 function run(rows, codex = {}) { return ctx.recordedTokenTotalsFor(rows, codex); }
 let cloud = recorded('claude', 11, {accounts: [recorded('a', 11), recorded('b', 11)]});
 let local = recorded('local', 900, {recentDays: [{date:'2026-10-12', messageCount:900, recorded:true}]});
-let quota = {providerId:'codex-hermes-1', providerName:'Codex (Hermes 1)', readOnly:true,
+let quotaId = 'codex-hermes-' + 'a'.repeat(64);
+let quota = {providerId:quotaId, providerName:'Codex (Hermes aaaaaaaa)', readOnly:true,
              hasLocalStats:false, todayTotalTokens:0, modelUsage:{}, limits:[{percent:0.5}]};
 let t = run([cloud, local, quota, cloud], recorded('codex', 500));
 assert.equal(t.cloud.today.value, 11, 'Aggregate and accounts, Local, and duplicate provider must not be added twice');
@@ -55,7 +56,7 @@ assert.equal(t.cloud.today.sources, 2); assert.equal(t.cloud.today.known, 1);
 assert.equal(t.local.today, 900); assert.equal(t.codex.history, 509, 'Native CLI must remain separately unattributed');
 assert.match(t.byProvider.claude, /11 today/);
 assert.match(t.byProvider.claude, /20 recorded/);
-assert.equal(t.byProvider['codex-hermes-1'], '', 'Quota-only cards need no repeated token disclaimer');
+assert.equal(t.byProvider[quotaId], '', 'Quota-only cards need no repeated token disclaimer');
 console.log('PASS aggregate once; Local and unattributed Codex separate; quota coverage explicit');
 let nativeClaude = ctx.recordedTokenCounters({id:'claude', hasLocalStats:true, todayTotalTokens:11,
   recentDays:[{date:'2026-10-12',messageCount:11}],modelUsage:{m:{inputTokens:11}}});
