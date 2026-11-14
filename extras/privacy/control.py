@@ -31,8 +31,13 @@ def command(*args):
     return p.stdout.strip()
 
 
-def manager():
-    if command("xdg-mime", "query", "default", "inode/directory") != "org.gnome.Nautilus.desktop":
+def manager(feature=None):
+    desktop = command("xdg-mime", "query", "default", "inode/directory")
+    if feature == "recent" and desktop == "folio.desktop":
+        raise Refused("Folio Recents is unsupported: this GNOME/GTK recording control does not hide "
+                      "its existing XBEL list. No settings were changed by this preflight; "
+                      "previously owned GNOME/GTK settings can be restored")
+    if desktop != "org.gnome.Nautilus.desktop":
         raise Refused("Unsupported default file manager; Nautilus is required")
 
 
@@ -58,7 +63,12 @@ class Setting:
         return {"raw": self.desired, "effective": self.desired}
 
     def validate(self, value):
-        if not isinstance(value, dict) or set(value) != {"raw", "effective"} or value["effective"] not in self.values or value["raw"] not in self.values | {""}:
+        # Explicit persisted values must agree with their effective readback.
+        # An unset original may legitimately follow a changed schema default.
+        if (not isinstance(value, dict) or set(value) != {"raw", "effective"}
+                or value["effective"] not in self.values
+                or value["raw"] not in self.values | {""}
+                or (value["raw"] and value["raw"] != value["effective"])):
             raise Refused("Malformed setting ownership record")
 
     def equal(self, a, b):
@@ -80,6 +90,13 @@ def gtk_text(data):
     text = (data or b"").decode("utf-8")
     parser = configparser.ConfigParser(interpolation=None, strict=True)
     parser.optionxform = str
+    # ConfigParser accepts a header prefix followed by arbitrary text, while
+    # the byte-preserving transformer below needs a complete header line.
+    # Refuse that ambiguity rather than reporting an unchanged enabled file
+    # as a successfully disabled recording target.
+    if any(line.strip().startswith("[") and not parser.SECTCRE.fullmatch(line.strip())
+           for line in text.splitlines()):
+        raise Refused("Unsupported GTK section header")
     try:
         parser.read_file(io.StringIO(text))
     except configparser.Error as exc:
@@ -131,8 +148,11 @@ class Gtk:
             if section == "Settings" and not inserted:
                 out.append(block)
             text = "".join(out)
-        gtk_text(text.encode())
-        return encode(text.encode())
+        target = text.encode()
+        _, target_parser = gtk_text(target)
+        if target_parser.get("Settings", "gtk-recent-files-enabled", fallback="true").lower() != "false":
+            raise Refused("GTK recording target did not disable recent-file recording")
+        return encode(target)
 
     @staticmethod
     def equal(a, b):
@@ -242,8 +262,11 @@ class IndexUnit:
             raise Refused("Indexer command returned success but readback failed")
 
 
-def resources(home, feature):
-    manager()
+def resources(home, feature, *, restoring=False):
+    # Recent Restore owns only these fixed GNOME/GTK targets, not the current
+    # directory handler. Keep journal/target/conflict validation unchanged.
+    if feature != "recent" or not restoring:
+        manager(feature)
     if feature == "indexing":
         return [IndexUnit(home, n) for n in UNITS]
     result = [Setting(feature)]
@@ -302,7 +325,7 @@ def owned(item, saved, now, journal, action):
 
 
 def _change(home, feature, action):
-    items = resources(home, feature)
+    items = resources(home, feature, restoring=action == "restore")
     journal = Journal(home, "privacy/" + feature)
     if journal.data is None:
         if action == "restore":
@@ -373,6 +396,10 @@ def _change(home, feature, action):
 
 
 def change(home, feature, action):
+    # Unsupported Stop must not create even the state directory/lock. Check
+    # again in resources after locking rather than admitting a changed handler.
+    if action == "stop":
+        manager(feature)
     with home.lock("privacy"):
         return _change(home, feature, action)
 

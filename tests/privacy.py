@@ -84,6 +84,22 @@ class Privacy(unittest.TestCase):
                                       "defaults": {"remember-recent-files": "true", "show-image-thumbnails": "'local-only'"},
                                       "raw": {"remember-recent-files": "", "show-image-thumbnails": "'local-only'"},
                                       "calls": [], "units": units}))
+        # Package definitions are part of the mocked service boundary too.
+        # Never require or modify the host's LocalSearch installation.
+        self.package_units = self.home / "package-units"
+        self.package_units.mkdir()
+        for name, executable in (("localsearch-3.service", "/usr/lib/localsearch-3"),
+                                 ("localsearch-control-3.service", "/usr/lib/localsearch-control-3")):
+            (self.package_units / name).write_text("[Service]\nExecStart=" + executable + "\n")
+        self.driver = self.home / "privacy-driver.py"
+        self.driver.write_text(
+            "import importlib.util,sys\nfrom pathlib import Path\n"
+            + "sys.path.insert(0," + repr(str(BACKEND.parent)) + ")\n"
+            + "s=importlib.util.spec_from_file_location('privacy_under_test'," + repr(str(BACKEND)) + ")\n"
+            + "m=importlib.util.module_from_spec(s);s.loader.exec_module(m)\n"
+            + "h=importlib.util.spec_from_file_location('package_fixture'," + repr(str(REPO / "tests/privacy-package-fixture.py")) + ")\n"
+            + "f=importlib.util.module_from_spec(h);h.loader.exec_module(f);f.install_package_fixture(m)\n"
+            + "sys.exit(m.main())\n")
 
     def state(self):
         return json.loads(self.db.read_text())
@@ -92,7 +108,7 @@ class Privacy(unittest.TestCase):
         s = self.state(); s.update(kw); self.db.write_text(json.dumps(s))
 
     def runctl(self, feature, action="status", success=True, confirm=True, env=None):
-        args = ["/usr/bin/python3", "-B", str(BACKEND), feature, action]
+        args = ["/usr/bin/python3", "-B", str(self.driver), feature, action]
         if action != "status" and confirm:
             args += ["--confirm", "PURGE" if action == "purge" else "CHANGE"]
         p = subprocess.run(args, env=env or self.env, text=True, capture_output=True, timeout=30)
@@ -119,6 +135,219 @@ class Privacy(unittest.TestCase):
         self.assertFalse((self.home / ".config/gtk-4.0/settings.ini").exists())
         self.assertEqual(self.state()["raw"]["remember-recent-files"], "")
         self.runctl("recent", "restore")
+
+    def test_recent_rejects_suffixed_gtk_section_before_mutation(self):
+        for version in (3, 4):
+            for header in ("[Settings] # note", "[Settings]; note", "[Settings] trailing"):
+                with self.subTest(version=version, header=header):
+                    fx = self.fresh_fixture()
+                    gtk = fx.config(version, header + "\ngtk-recent-files-enabled=true\ngtk-theme-name=keep\n")
+                    neighbor = fx.config(7 - version, "[Settings]\ngtk-theme-name=neighbor\n")
+                    before = {p: p.read_bytes() for p in (gtk, neighbor)}
+                    settings = fx.state()
+                    refused = fx.runctl("recent", "stop", success=False)
+                    self.assertIn("GTK section header", refused.stderr)
+                    self.assertEqual({p: p.read_bytes() for p in before}, before)
+                    after = fx.state()
+                    for key in ("values", "raw", "units"):
+                        self.assertEqual(after[key], settings[key])
+                    self.assertFalse(any(c[:2] in (["gsettings", "set"], ["gsettings", "reset"])
+                                         for c in after["calls"]))
+                    self.assertFalse((Path(fx.env["XDG_STATE_HOME"]) / "a-la-carchy/privacy/recent.json").exists())
+
+    def test_recent_generated_gtk_target_requires_disabled_readback(self):
+        gtk = self.config(3, "[Settings]\ngtk-recent-files-enabled=true\ngtk-theme-name=keep\n")
+        before, settings = gtk.read_bytes(), self.state()
+        mod = self.load_control()
+        real_parse, reached = mod.gtk_text, []
+        def enabled_target(data):
+            text, parser = real_parse(data)
+            if "# >>> a-la-carchy privacy recent" in text:
+                reached.append("synthetic target-semantic readback")
+                parser.set("Settings", "gtk-recent-files-enabled", "true")
+            return text, parser
+        with patch.dict(os.environ, self.env, clear=True), patch.object(mod, "gtk_text", enabled_target):
+            home = mod.Home()
+            try:
+                with self.assertRaisesRegex(mod.Refused, "GTK recording target did not disable"):
+                    mod.change(home, "recent", "stop")
+            finally:
+                home.close()
+        self.assertEqual(reached, ["synthetic target-semantic readback"])
+        self.assertEqual(gtk.read_bytes(), before)
+        self.assertFalse((Path(self.env["XDG_CONFIG_HOME"]) / "gtk-4.0/settings.ini").exists())
+        after = self.state()
+        for key in ("values", "raw", "units"):
+            self.assertEqual(after[key], settings[key])
+        self.assertFalse(any(c[:2] in (["gsettings", "set"], ["gsettings", "reset"])
+                             for c in after["calls"]))
+        self.assertFalse((Path(self.env["XDG_STATE_HOME"]) / "a-la-carchy/privacy/recent.json").exists())
+
+    def test_recent_restore_rejects_contradictory_original_before_any_write(self):
+        for raw, effective in (("true", "false"), ("false", "true")):
+            with self.subTest(raw=raw, effective=effective):
+                fx = self.fresh_fixture()
+                gtk = [fx.config(v, "[Settings]\ngtk-theme-name=keep\ngtk-recent-files-enabled=true\n")
+                       for v in (3, 4)]
+                fx.runctl("recent", "stop")
+                journal = Path(fx.env["XDG_STATE_HOME"]) / "a-la-carchy/privacy/recent.json"
+                record = json.loads(journal.read_text())
+                self.assertEqual(record["items"][0]["id"], "recent:gsettings")
+                record["items"][0]["original"] = {"raw": raw, "effective": effective}
+                journal.write_text(json.dumps(record))
+                fx.change(manager="folio.desktop", calls=[])
+                before = fx.state()
+                gtk_before, journal_before = [p.read_bytes() for p in gtk], journal.read_bytes()
+                refused = fx.runctl("recent", "restore", success=False)
+                after = fx.state()
+                self.assertFalse(any(c[:2] in (["gsettings", "set"], ["gsettings", "reset"])
+                                     for c in after["calls"]), after["calls"])
+                for key in ("values", "raw", "defaults", "units", "manager"):
+                    self.assertEqual(after[key], before[key])
+                self.assertEqual([p.read_bytes() for p in gtk], gtk_before)
+                self.assertEqual(journal.read_bytes(), journal_before)
+                self.assertIn("Malformed setting ownership record", refused.stderr)
+
+    def test_setting_original_validation_preserves_consistent_and_unset_values(self):
+        mod = self.load_control()
+        with patch.dict(os.environ, self.env, clear=True):
+            for feature in ("recent", "thumbnails"):
+                setting = mod.Setting(feature)
+                for raw in sorted(setting.values | {""}):
+                    for effective in sorted(setting.values):
+                        with self.subTest(feature=feature, raw=raw, effective=effective):
+                            value = {"raw": raw, "effective": effective}
+                            if raw and raw != effective:
+                                with self.assertRaisesRegex(mod.Refused, "Malformed setting ownership record"):
+                                    setting.validate(value)
+                            else:
+                                setting.validate(value)
+
+    def test_recent_restore_unset_original_allows_changed_schema_default(self):
+        gtk = [self.config(v, "[Settings]\ngtk-theme-name=original\n") for v in (3, 4)]
+        before = [p.read_bytes() for p in gtk]
+        self.runctl("recent", "stop")
+        state = self.state()
+        state["defaults"]["remember-recent-files"] = "false"
+        self.change(**state)
+        self.change(manager="folio.desktop", calls=[])
+        self.runctl("recent", "restore")
+        self.assertEqual(self.state()["raw"]["remember-recent-files"], "")
+        self.assertEqual(self.state()["values"]["remember-recent-files"], "false")
+        self.assertEqual([p.read_bytes() for p in gtk], before)
+        self.assertFalse((Path(self.env["XDG_STATE_HOME"]) / "a-la-carchy/privacy/recent.json").exists())
+
+    def test_folio_stop_refuses_before_creating_state_or_touching_history(self):
+        self.change(manager="folio.desktop", calls=[])
+        gtk = self.config(3, "[Settings]\ngtk-theme-name=keep\n")
+        history = Path(self.env["XDG_DATA_HOME"]) / "recently-used.xbel"
+        history.parent.mkdir(parents=True, exist_ok=True)
+        history.write_bytes(b'<xbel><bookmark href="file:///synthetic/kept"/></xbel>')
+        original_gtk, original_history = gtk.read_bytes(), history.read_bytes()
+        result = self.runctl("recent", "stop", success=False)
+        self.assertIn("Folio", result.stderr)
+        self.assertIn("does not hide", result.stderr)
+        self.assertEqual(self.state()["calls"], [["xdg-mime", "query", "default", "inode/directory"]])
+        self.assertEqual(gtk.read_bytes(), original_gtk)
+        self.assertEqual(history.read_bytes(), original_history)
+        self.assertEqual(self.state()["raw"]["remember-recent-files"], "")
+        self.assertFalse(Path(self.env["XDG_STATE_HOME"]).exists())
+        self.assertFalse((Path(self.env["XDG_CONFIG_HOME"]) / "folio").exists())
+
+    def test_recent_owned_restore_survives_switch_to_folio(self):
+        gtk = self.config(3, "# original\n[Settings]\ngtk-theme-name=keep\n")
+        before = gtk.read_bytes()
+        history = Path(self.env["XDG_DATA_HOME"]) / "recently-used.xbel"
+        history.parent.mkdir(parents=True, exist_ok=True)
+        history.write_bytes(b"<xbel/>")
+        self.runctl("recent", "stop")
+        journal = Path(self.env["XDG_STATE_HOME"]) / "a-la-carchy/privacy/recent.json"
+        self.assertEqual(json.loads(journal.read_text())["version"], 1)
+        self.change(manager="folio.desktop", calls=[])
+        self.runctl("recent", "restore")
+        self.assertEqual(gtk.read_bytes(), before)
+        self.assertFalse((self.home / ".config/gtk-4.0/settings.ini").exists())
+        self.assertEqual(self.state()["raw"]["remember-recent-files"], "")
+        self.assertEqual(self.state()["values"]["remember-recent-files"], "true")
+        self.assertFalse(journal.exists())
+        self.assertEqual(history.read_bytes(), b"<xbel/>")
+        self.assertFalse((self.home / ".config/folio").exists())
+        self.assertFalse(any(c[0] == "xdg-mime" for c in self.state()["calls"]))
+        repeat = self.runctl("recent", "restore")
+        self.assertIn("Not managed; nothing to restore", repeat.stdout)
+        self.assertEqual(gtk.read_bytes(), before)
+        self.assertEqual(history.read_bytes(), b"<xbel/>")
+
+    def test_changed_manager_restore_preserves_newer_gtk_edit(self):
+        gtk = self.config(3, "[Settings]\ngtk-theme-name=original\n")
+        self.runctl("recent", "stop")
+        owned = gtk.read_bytes()
+        newer = owned + b"gtk-font-name=newer-user-edit\n"
+        gtk.write_bytes(newer)
+        journal = Path(self.env["XDG_STATE_HOME"]) / "a-la-carchy/privacy/recent.json"
+        before = journal.read_bytes()
+        self.change(manager="folio.desktop", calls=[])
+        refused = self.runctl("recent", "restore", success=False)
+        self.assertIn("newer/conflicting", refused.stderr)
+        self.assertEqual(gtk.read_bytes(), newer)
+        self.assertEqual(journal.read_bytes(), before)
+        self.assertEqual(self.state()["raw"]["remember-recent-files"], "false")
+        self.assertFalse(any(c[:2] in (["gsettings", "set"], ["gsettings", "reset"]) for c in self.state()["calls"]))
+        gtk.write_bytes(owned)  # Explicit fixture reconciliation, not product overwrite.
+        self.runctl("recent", "restore")
+        self.assertFalse(journal.exists())
+
+    def test_changed_manager_restore_still_rejects_modified_journal_targets(self):
+        self.runctl("recent", "stop")
+        journal = Path(self.env["XDG_STATE_HOME"]) / "a-la-carchy/privacy/recent.json"
+        data = json.loads(journal.read_text())
+        data["items"][0]["target"]["effective"] = "true"
+        journal.write_text(json.dumps(data))
+        before = journal.read_bytes()
+        gtk = self.home / ".config/gtk-3.0/settings.ini"
+        gtk_before = gtk.read_bytes()
+        self.change(manager="folio.desktop", calls=[])
+        refused = self.runctl("recent", "restore", success=False)
+        self.assertIn("ownership target was modified", refused.stderr)
+        self.assertEqual(journal.read_bytes(), before)
+        self.assertEqual(gtk.read_bytes(), gtk_before)
+        self.assertEqual(self.state()["raw"]["remember-recent-files"], "false")
+        self.assertFalse(any(c[:2] in (["gsettings", "set"], ["gsettings", "reset"]) for c in self.state()["calls"]))
+
+    def test_partial_recent_stop_can_restore_originals_after_manager_change(self):
+        gtk = self.config(3, "# original\n[Settings]\ngtk-theme-name=keep\n")
+        before = gtk.read_bytes()
+        history = Path(self.env["XDG_DATA_HOME"]) / "recently-used.xbel"
+        history.parent.mkdir(parents=True, exist_ok=True)
+        history.write_bytes(b"<xbel/>")
+        mod = self.load_control()
+        real_put = mod.Gtk.put
+        reached = []
+        def fail_gtk4(item, value, expected):
+            if item.id == "recent:gtk4":
+                reached.append(item.id)
+                raise mod.Refused("synthetic GTK4 write failure")
+            return real_put(item, value, expected)
+        with patch.dict(os.environ, self.env, clear=True), patch.object(mod.Gtk, "put", fail_gtk4):
+            home = mod.Home()
+            try:
+                with self.assertRaisesRegex(mod.Refused, "synthetic GTK4 write failure"):
+                    mod.change(home, "recent", "stop")
+            finally:
+                home.close()
+        self.assertEqual(reached, ["recent:gtk4"])
+        self.assertEqual(self.state()["raw"]["remember-recent-files"], "false")
+        self.assertIn(b"gtk-recent-files-enabled=false", gtk.read_bytes())
+        journal = Path(self.env["XDG_STATE_HOME"]) / "a-la-carchy/privacy/recent.json"
+        self.assertEqual(json.loads(journal.read_text())["phase"], "failed")
+        self.change(manager="folio.desktop", calls=[])
+        self.runctl("recent", "restore")
+        self.assertEqual(gtk.read_bytes(), before)
+        self.assertEqual(self.state()["raw"]["remember-recent-files"], "")
+        self.assertFalse((self.home / ".config/gtk-4.0/settings.ini").exists())
+        self.assertFalse(journal.exists())
+        self.assertEqual(history.read_bytes(), b"<xbel/>")
+        self.assertFalse(any(c[0] == "xdg-mime" for c in self.state()["calls"]))
 
     def test_explicit_original_value_and_already_off(self):
         s = self.state(); s["values"]["remember-recent-files"] = "false"; s["raw"]["remember-recent-files"] = "false"; self.change(**s)
@@ -174,6 +403,29 @@ class Privacy(unittest.TestCase):
         s["units"][name].update(LoadState="masked", UnitFileState="masked", ActiveState="inactive", FragmentPath=str(mask) if fragment is None else fragment)
         self.change(**s)
         return mask
+
+    def test_index_private_package_sources_preserve_definition_guards(self):
+        for kind in ("owner", "mode", "definition", "symlink", "missing"):
+            with self.subTest(kind=kind):
+                fx = self.fresh_fixture()
+                source = fx.package_units / "localsearch-3.service"
+                before = fx.state()["units"]
+                if kind == "owner":
+                    fx.change(package_unit_uid=os.getuid())
+                elif kind == "mode":
+                    source.chmod(0o622)
+                elif kind == "definition":
+                    source.write_text("[Service]\nExecStart=/synthetic/wrong\n")
+                elif kind == "symlink":
+                    source.unlink()
+                    source.symlink_to(fx.package_units / "localsearch-control-3.service")
+                else:
+                    source.unlink()
+                fx.runctl("indexing", "stop", success=False)
+                self.assertEqual(fx.state()["units"], before)
+                self.assertFalse(any(c[0] == "systemctl" for c in fx.state()["calls"]))
+                self.assertFalse(fx.mask_path().exists())
+                self.assertFalse((Path(fx.env["XDG_STATE_HOME"]) / "a-la-carchy/privacy/indexing.json").exists())
 
     def test_index_exact_scope_and_original_activity(self):
         self.runctl("indexing", "stop"); self.runctl("indexing", "stop")
@@ -689,6 +941,10 @@ class Privacy(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("privacy_race", BACKEND)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        helper = importlib.util.spec_from_file_location("package_fixture", REPO / "tests/privacy-package-fixture.py")
+        assert helper is not None and helper.loader is not None
+        fixture = importlib.util.module_from_spec(helper); helper.loader.exec_module(fixture)
+        fixture.install_package_fixture(module)
         return module
 
     def restore_interleaving(self, original):

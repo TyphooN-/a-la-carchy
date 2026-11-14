@@ -133,6 +133,25 @@ class Menus(unittest.TestCase):
         out = self.menu(23, 3, [("Continue?", "yes"), ("Type PURGE", "PURGE"), ("Press Enter", "")])
         self.assertIn("not secure erasure", out); self.assertFalse(f.exists())
 
+    def test_folio_dialog_scope_and_owned_restore_after_manager_change(self):
+        self.fx.change(manager="folio.desktop", calls=[])
+        out = self.menu(23, 0, [("Choice:", "0")])
+        self.assertIn("Existing recent lists remain visible", out)
+        self.assertNotIn("Removes convenient recent lists", out)
+        self.assertIn("Folio", out)
+        self.assertFalse(any(c[:2] in (["gsettings", "set"], ["gsettings", "reset"]) for c in self.fx.state()["calls"]))
+        refused = self.menu(23, 0, [("Choice:", "1"), ("Continue?", "yes"), ("Press Enter", "")], expected_exit=1)
+        self.assertIn("does not hide", refused)
+        self.assertFalse(Path(self.env["XDG_STATE_HOME"]).exists())
+        self.fx.change(manager="org.gnome.Nautilus.desktop")
+        self.fx.runctl("recent", "stop")
+        self.fx.change(manager="folio.desktop")
+        restored = self.menu(23, 0, [("Choice:", "2"), ("Continue?", "yes"), ("Press Enter", "")])
+        self.assertIn("readback verified", restored)
+        self.assertEqual(self.fx.state()["values"]["remember-recent-files"], "true")
+        self.assertFalse((self.home / ".config/gtk-3.0/settings.ini").exists())
+        self.assertFalse((self.home / ".config/gtk-4.0/settings.ini").exists())
+
     def test_hardening_audit_enable_restore_and_privilege_refusal(self):
         out = self.menu(24, 0, [("Press Enter", "")]); self.assertIn("bounded", out)
         self.assertFalse(any(c[0] == "sudo" for c in self.fx.state()["calls"]))
