@@ -1007,5 +1007,80 @@ class Privacy(unittest.TestCase):
         self.runctl("thumbnails", "stop", success=False)
 
 
+    def test_native_capability_loss_after_apply_retains_recoverable_failure(self):
+        self.change(manager="folio.desktop", calls=[])
+        gtk = self.config(3, "[Settings]\ngtk-theme-name=original\n")
+        original = gtk.read_bytes()
+        mod = self.load_control()
+        available, reached = [True], []
+        real_put = mod.Gtk.put
+        def capability():
+            if not available[0]:
+                reached.append("late capability refusal")
+                raise mod.Refused("synthetic native capability no longer valid")
+        def replace_after_last_write(item, value, expected):
+            result = real_put(item, value, expected)
+            if item.id == "recent:gtk4":
+                available[0] = False
+            return result
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch.object(mod, "folio_capability", capability), \
+                patch.object(mod.Gtk, "put", replace_after_last_write):
+            home = mod.Home()
+            try:
+                with self.assertRaisesRegex(mod.Refused, "synthetic native capability no longer valid"):
+                    mod.change(home, "recent", "stop")
+                self.assertEqual(reached, ["late capability refusal"])
+                journal = Path(self.env["XDG_STATE_HOME"]) / "a-la-carchy/privacy/recent.json"
+                self.assertEqual(json.loads(journal.read_text())["phase"], "failed")
+                self.change(manager="thunar.desktop", calls=[])
+                mod.change(home, "recent", "restore")
+            finally:
+                home.close()
+        self.assertEqual(gtk.read_bytes(), original)
+        self.assertEqual(self.state()["raw"]["remember-recent-files"], "")
+        self.assertFalse((self.home / ".config/gtk-4.0/settings.ini").exists())
+
+    def test_native_folio_stop_restore_preserves_fixed_targets_and_history(self):
+        self.change(manager="folio.desktop", calls=[])
+        gtk = self.config(3, "[Settings]\ngtk-theme-name=keep\ngtk-recent-files-enabled=true\n")
+        original = gtk.read_bytes()
+        history = Path(self.env["XDG_DATA_HOME"]) / "recently-used.xbel"
+        history.parent.mkdir(parents=True, exist_ok=True)
+        history.write_bytes(b'<xbel><bookmark href="file:///synthetic/kept"/></xbel>')
+        history_before = history.read_bytes()
+        mod = self.load_control()
+        checks = []
+        def compatible_package():
+            # The native policy and real package-admission guards have their
+            # own tests. This seam models only a verified compatible package.
+            checks.append("verified native package")
+        with patch.dict(os.environ, self.env, clear=True), patch.object(
+                mod, "folio_capability", compatible_package, create=True):
+            home = mod.Home()
+            try:
+                try:
+                    mod.change(home, "recent", "stop")
+                except mod.Refused as exc:
+                    self.fail("Verified compatible Folio was refused: " + str(exc))
+                self.assertEqual(self.state()["values"]["remember-recent-files"], "false")
+                self.assertIn(b"gtk-recent-files-enabled=false", gtk.read_bytes())
+                mod.change(home, "recent", "stop")
+                journal = Path(self.env["XDG_STATE_HOME"]) / "a-la-carchy/privacy/recent.json"
+                self.assertEqual([row["id"] for row in json.loads(journal.read_text())["items"]],
+                                 ["recent:gsettings", "recent:gtk3", "recent:gtk4"])
+                self.assertGreaterEqual(len(checks), 2)
+                checked = len(checks)
+                self.change(manager="thunar.desktop", calls=[])
+                mod.change(home, "recent", "restore")
+                self.assertEqual(len(checks), checked, "Restore must not depend on the current handler/package")
+            finally:
+                home.close()
+        self.assertEqual(gtk.read_bytes(), original)
+        self.assertFalse((self.home / ".config/gtk-4.0/settings.ini").exists())
+        self.assertEqual(self.state()["raw"]["remember-recent-files"], "")
+        self.assertEqual(history.read_bytes(), history_before)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

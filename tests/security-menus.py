@@ -136,7 +136,10 @@ class Menus(unittest.TestCase):
     def test_folio_dialog_scope_and_owned_restore_after_manager_change(self):
         self.fx.change(manager="folio.desktop", calls=[])
         out = self.menu(23, 0, [("Choice:", "0")])
-        self.assertIn("Existing recent lists remain visible", out)
+        self.assertIn("Compatible native Folio hides its built-in Recents", out)
+        self.assertIn("Stock/unverified Folio is refused", out)
+        self.assertIn("Close Folio, GTK applications and configuration editors", out)
+        self.assertIn("no history is deleted", out)
         self.assertNotIn("Removes convenient recent lists", out)
         self.assertIn("Folio", out)
         self.assertFalse(any(c[:2] in (["gsettings", "set"], ["gsettings", "reset"]) for c in self.fx.state()["calls"]))

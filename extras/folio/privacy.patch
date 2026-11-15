@@ -1,0 +1,191 @@
+--- a/src/foldermodel.cpp
++++ b/src/foldermodel.cpp
+@@ -1,4 +1,5 @@
+ #include "foldermodel.h"
++#include "recentprivacy.h"
+ 
+ #include <QCache>
+ #include <QCollator>
+@@ -89,6 +90,25 @@
+         setEntries({});
+ }
+ 
++bool FolderModel::blockPrivateRecents() {
++    if (m_path != recentPath() || folioRecentsEnabled())
++        return false;
++    // Reject cache adoption and late worker publication too. Cancel pending
++    // work, drop this view's watch, and clear visible entries synchronously.
++    ++m_generation;
++    *m_latest = m_generation;
++    m_debounce.stop();
++    if (!m_watcher.files().isEmpty())
++        m_watcher.removePaths(m_watcher.files());
++    recentListings().remove(cacheKey());
++    setSelected({});
++    clearEntries();
++    setError({});
++    setLoading(false);
++    emit loaded();
++    return true;
++}
++
+ int FolderModel::rowCount(const QModelIndex &parent) const {
+     return parent.isValid() ? 0 : m_entries.size();
+ }
+@@ -144,6 +164,8 @@
+     m_query = query;
+     emit queryChanged();
+     setSelected({});
++    if (blockPrivateRecents())
++        return;
+     // Back to the folder: its remembered listing shows at once.
+     if (m_query.isEmpty()) {
+         if (const auto *cached = recentListings().object(cacheKey()))
+@@ -164,8 +186,10 @@
+ 
+ void FolderModel::setPath(const QString &path) {
+     const QString clean = path.isEmpty() || isView(path) ? path : QDir::cleanPath(path);
+-    if (clean == m_path)
+-        return;
++    if (clean == m_path) {
++        blockPrivateRecents();
++        return;
++    }
+     if (!m_watcher.directories().isEmpty())
+         m_watcher.removePaths(m_watcher.directories());
+     if (!m_watcher.files().isEmpty())
+@@ -184,6 +208,8 @@
+     // empty frame between them. A slow listing (another machine's) clears it
+     // after a moment, so the old folder never lingers under the new path.
+     // An empty path is a column with nothing to show yet.
++    if (blockPrivateRecents())
++        return;
+     if (m_path.isEmpty()) {
+         // What's still being read is for the folder left behind.
+         ++m_generation;
+@@ -356,6 +382,10 @@
+ // most recently used first.
+ QVector<FolderModel::Entry> FolderModel::listRecent(const QString &xbel, bool showHidden, int limit,
+                                                     const std::function<bool()> &stop) {
++    // Direct recent: navigation and lower-level callers must not open XBEL
++    // while recording is disabled; hiding the sidebar alone is insufficient.
++    if (!folioRecentsEnabled())
++        return {};
+     struct Used { QString path; QDateTime when; };
+     QVector<Used> used;
+     QFile file(xbel);
+@@ -391,6 +421,10 @@
+         if (entries.size() == limit)
+             break;
+     }
++    // A policy change while this worker was reading must not publish its
++    // completed listing. History itself is deliberately left untouched.
++    if (!folioRecentsEnabled())
++        return {};
+     return entries;
+ }
+ 
+@@ -439,8 +473,10 @@
+ }
+ 
+ void FolderModel::reload() {
+-    if (m_path.isEmpty())
+-        return;
++    if (m_path.isEmpty() || blockPrivateRecents())
++        return;
++    if (m_path == recentPath() && !m_watcher.files().contains(recentFile()))
++        m_watcher.addPath(recentFile());
+     const quint64 generation = ++m_generation;
+     setLoading(true);
+ 
+@@ -457,6 +493,8 @@
+         watcher->deleteLater();
+         if (generation != m_generation)
+             return; // A newer listing replaced this one while it ran.
++        if (blockPrivateRecents())
++            return;
+         m_staleClear.stop();
+         const auto [entries, error] = watcher->result();
+         // Unchanged (the usual case after showing a remembered listing):
+@@ -507,6 +545,8 @@
+         watcher->deleteLater();
+         if (generation != m_generation)
+             return;
++        if (blockPrivateRecents())
++            return;
+         bool updated = false;
+         for (const auto &[row, summary] : watcher->result()) {
+             if (row >= m_entries.size() || m_entries[row].path != summary.path)
+--- a/src/foldermodel.h
++++ b/src/foldermodel.h
+@@ -159,6 +159,7 @@
+     void setLoading(bool loading);
+     void setEntries(const QVector<Entry> &entries);
+     void clearEntries();
++    bool blockPrivateRecents();
+     QString cacheKey() const;
+     void remember();
+     static bool sameListing(const QVector<Entry> &a, const QVector<Entry> &b);
+--- a/src/places.cpp
++++ b/src/places.cpp
+@@ -2,6 +2,7 @@
+ #include "disks.h"
+ #include "fileops.h"
+ #include "foldermodel.h"
++#include "recentprivacy.h"
+ 
+ #include <QCollator>
+ #include <QDir>
+@@ -178,8 +179,10 @@
+ 
+     // Views: lists that aren't a folder of their own. The sidebar names
+     // them, so a language switch renames them at once.
+-    m_views = {QVariantMap{{"path", FolderModel::recentPath()}, {"icon", "recent"}},
+-               QVariantMap{{"path", QDir::cleanPath(FileOps::homeTrash() + "/files")}, {"icon", "trash"}}};
++    m_views.clear();
++    if (folioRecentsEnabled())
++        m_views << QVariantMap{{"path", FolderModel::recentPath()}, {"icon", "recent"}};
++    m_views << QVariantMap{{"path", QDir::cleanPath(FileOps::homeTrash() + "/files")}, {"icon", "trash"}};
+ }
+ 
+ QString Places::bookmarksPath() const {
+--- /dev/null
++++ b/src/recentprivacy.cpp
+@@ -0,0 +1,29 @@
++#include "recentprivacy.h"
++
++#include <gio/gio.h>
++
++bool folioRecentsEnabled() {
++    auto *source = g_settings_schema_source_get_default();
++    auto *schema = source ? g_settings_schema_source_lookup(source, "org.gnome.desktop.privacy", TRUE) : nullptr;
++    // Preserve upstream behavior on desktops without this policy schema.
++    if (!schema)
++        return true;
++    if (!g_settings_schema_has_key(schema, "remember-recent-files")) {
++        g_settings_schema_unref(schema);
++        return true;
++    }
++    auto *key = g_settings_schema_get_key(schema, "remember-recent-files");
++    const bool boolean = g_variant_type_equal(g_settings_schema_key_get_value_type(key), G_VARIANT_TYPE_BOOLEAN);
++    g_settings_schema_key_unref(key);
++    if (!boolean) {
++        g_settings_schema_unref(schema);
++        return true;
++    }
++    // Do not cache a policy value across Stop/Restore. GSettings is already a
++    // Folio dependency; no subprocess, history lookup or settings write occurs.
++    auto *settings = g_settings_new_full(schema, nullptr, nullptr);
++    const bool enabled = g_settings_get_boolean(settings, "remember-recent-files");
++    g_object_unref(settings);
++    g_settings_schema_unref(schema);
++    return enabled;
++}
+--- /dev/null
++++ b/src/recentprivacy.h
+@@ -0,0 +1,5 @@
++#pragma once
++
++// The shared GNOME policy controls Folio's built-in Recents reader and view.
++// This never reads, changes or removes the history index itself.
++bool folioRecentsEnabled();

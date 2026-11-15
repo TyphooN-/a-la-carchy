@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Unified patch context lines intentionally contain one space.
+extras/folio/*.patch whitespace=-blank-at-eol

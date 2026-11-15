@@ -1,0 +1,31 @@
+{
+  "upstream_version": "0.4.0",
+  "archive_sha256": "cb33e4e3dc36a992c42bd3bacb771c4413e6a96db0264127c3f9adee14ce0840",
+  "native_changed_files": [
+    {
+      "path": "src/foldermodel.cpp",
+      "baseline_sha256": "eb1ea35550a5e0f28024ec9e4d80d76a40b803f00f5fa303814341ea60d9d3e2",
+      "patched_sha256": "3dfc8d10e743c38b27a6ad218ef91317ffbd449d6572db3b1c6907adcd11706f"
+    },
+    {
+      "path": "src/foldermodel.h",
+      "baseline_sha256": "cb05fad25cd97d5c77dbf268e74552cb61c5563de7dea044633c00353f3c9474",
+      "patched_sha256": "38e8a9da57093bd385b7b85ceec586fdc4ca13987fe82830d4ff6431ac359631"
+    },
+    {
+      "path": "src/places.cpp",
+      "baseline_sha256": "0081eb921a158e57e6b886fb5a3fdf55d0c9ecaa45550ebe2f313028e08d2db1",
+      "patched_sha256": "56318f4134c19fb8ee7131c0f6c3f12a8bfc45c6d04cdbd7b8ceb17e50f3e309"
+    },
+    {
+      "path": "src/recentprivacy.cpp",
+      "baseline_sha256": null,
+      "patched_sha256": "97ee111bb7d99b830a5db649c9ad8a90722e62bb6429ec4de66e7f41ebb31f94"
+    },
+    {
+      "path": "src/recentprivacy.h",
+      "baseline_sha256": null,
+      "patched_sha256": "b92881ae4a2d47ff097a50b6633321d895296c160fdf68f05e552db107b6433c"
+    }
+  ]
+}

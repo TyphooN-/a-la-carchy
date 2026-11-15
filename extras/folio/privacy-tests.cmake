@@ -1,0 +1,10 @@
+# Included only by the maintained patched Folio package build.
+add_executable(alacarchy_recents_probe tests/recents_probe.cpp)
+target_link_libraries(alacarchy_recents_probe PRIVATE folio_core)
+add_executable(alacarchy_recents_model_probe tests/native_model_probe.cpp)
+target_link_libraries(alacarchy_recents_model_probe PRIVATE folio_core)
+add_test(NAME alacarchy_recents_reader COMMAND alacarchy_recents_probe)
+add_test(NAME alacarchy_recents_model COMMAND alacarchy_recents_model_probe)
+set_tests_properties(alacarchy_recents_reader alacarchy_recents_model PROPERTIES
+  ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software;GSETTINGS_BACKEND=memory"
+  TIMEOUT 60)

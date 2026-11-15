@@ -1,0 +1,60 @@
+# Local source integration, not a published Folio release. Never auto-install.
+pkgname=folio
+pkgver=0.4.0
+pkgrel=3.1
+pkgdesc='Omarchy file manager with reversible native Recents privacy support (local patch)'
+arch=('x86_64')
+url='https://github.com/omacom/folio'
+license=('MIT')
+depends=('glib2' 'gsettings-desktop-schemas' 'hicolor-icon-theme' 'libarchive'
+         'qt6-base' 'qt6-declarative' 'qt6-imageformats' 'qt6-multimedia'
+         'qt6-svg' 'qt6-wayland' 'xdg-utils' 'zlib')
+makedepends=('cmake' 'ninja' 'pkgconf' 'python')
+optdepends=('qt6-webengine: PDF previews (Qt PDF)')
+# Capability hashes must describe the final packaged ELF, not a pre-strip ELF.
+options=('!strip' '!debug')
+source=("folio-${pkgver}.tar.gz::https://github.com/omacom/folio/archive/refs/tags/v${pkgver}.tar.gz"
+        'privacy.patch' 'recents_probe.cpp' 'native_model_probe.cpp'
+        'privacy-tests.cmake' 'write-capability.py')
+sha256sums=(
+  'cb33e4e3dc36a992c42bd3bacb771c4413e6a96db0264127c3f9adee14ce0840'
+  '131f70d65e3a1598d95cade2d08b1375bdc3060b22373ab9c2000e64d207b4ab'
+  '28fd87cefa349b3b3d44ffdb91f6c949ae2125f364f6327bd23ba48629abb151'
+  '361e71c5e408de6bb1203b324b1af64d321d681061ece0e6cb290c73b660a86c'
+  '5cfe94a01e3e56f1a641698e70c690581e6890f79acb6b68513ae240e802f648'
+  'dd6857bab4d87300d8a1ba68ac538ebca2da720f15049c5475deea329d07a614'
+ )
+
+prepare() {
+  patch -d "folio-${pkgver}" -Np1 -i "${srcdir}/privacy.patch"
+  cp recents_probe.cpp native_model_probe.cpp "folio-${pkgver}/tests/"
+  cp privacy-tests.cmake "folio-${pkgver}/tests/alacarchy-privacy.cmake"
+  printf '\ninclude(tests/alacarchy-privacy.cmake)\n' >> "folio-${pkgver}/CMakeLists.txt"
+  python -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); s=p.read_text(); assert s.count("Exec=folio %U")==1; p.write_text(s.replace("Exec=folio %U", "Exec=/usr/bin/folio %U"))' "folio-${pkgver}/share/folio.desktop"
+}
+
+build() {
+  cmake -S "folio-${pkgver}" -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+  cmake --build build --parallel "$(nproc)"
+}
+
+check() {
+  if [[ ${ALACARCHY_FOLIO_PRIVATE_NATIVE:-} != 1 || $HOME != /fixture/* ||
+        ${GSETTINGS_BACKEND:-} != memory || ${QT_QPA_PLATFORM:-} != offscreen ]]; then
+    error 'Native tests require the independently enforced private build envelope; see README.md'
+    return 1
+  fi
+  ctest --test-dir build -V -R '^alacarchy_recents_' --output-on-failure
+}
+
+package() {
+  install -Dm755 build/folio "${pkgdir}/usr/bin/folio"
+  install -Dm644 "folio-${pkgver}/share/folio.desktop" "${pkgdir}/usr/share/applications/folio.desktop"
+  install -Dm644 "folio-${pkgver}/share/folio.svg" "${pkgdir}/usr/share/icons/hicolor/scalable/apps/folio.svg"
+  install -Dm644 "folio-${pkgver}/LICENSE" "${pkgdir}/usr/share/licenses/folio/LICENSE"
+  install -Dm644 "folio-${pkgver}/README.md" "${pkgdir}/usr/share/doc/folio/README.md"
+  install -Dm644 "folio-${pkgver}/docs/plugins.md" "${pkgdir}/usr/share/doc/folio/plugins.md"
+  install -dm755 "${pkgdir}/usr/share/folio/plugins"
+  cp -a --no-preserve=ownership "folio-${pkgver}/plugins/." "${pkgdir}/usr/share/folio/plugins/"
+  python "${srcdir}/write-capability.py" "${pkgdir}/usr"
+}

@@ -11,6 +11,14 @@ import subprocess
 import sys
 
 from safeio import Home, Journal, Refused, decode, encode
+from folio_support import require_capability
+
+FOLIO_ROOT = Path("/usr")
+
+
+def folio_capability():
+    # Fixed system package location, never a user-supplied executable/flag.
+    return require_capability(FOLIO_ROOT)
 
 SETTINGS = {
     "recent": ("org.gnome.desktop.privacy", "remember-recent-files", "/org/gnome/desktop/privacy/", "false", {"true", "false"}),
@@ -34,9 +42,8 @@ def command(*args):
 def manager(feature=None):
     desktop = command("xdg-mime", "query", "default", "inode/directory")
     if feature == "recent" and desktop == "folio.desktop":
-        raise Refused("Folio Recents is unsupported: this GNOME/GTK recording control does not hide "
-                      "its existing XBEL list. No settings were changed by this preflight; "
-                      "previously owned GNOME/GTK settings can be restored")
+        folio_capability()
+        return
     if desktop != "org.gnome.Nautilus.desktop":
         raise Refused("Unsupported default file manager; Nautilus is required")
 
@@ -384,10 +391,14 @@ def _change(home, feature, action):
             journal.save(None)
             print("Original configuration and user-service activity restored")
         else:
+            if feature == "recent":
+                # Package/handler drift during apply must not publish a false
+                # stopped claim. Retain the failed journal for owned Restore.
+                manager(feature)
             journal.save(dict(journal.data, phase="applied"))
             print("Stopped; settings/readback verified. Existing history is NOT deleted.")
             if feature == "recent":
-                print("Restart GTK applications yourself; independent app history is outside this scope.")
+                print("Restart affected GTK applications and compatible Folio yourself; independent app histories are outside this scope.")
             if feature == "indexing":
                 print("Only LocalSearch indexer + indexing proxy masked/stopped. Existing index retained; search may degrade.")
     except Exception:
